@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import Image from "next/image";
 import {
   ACTIONS, ADVISORS, Candidate, EVIDENCE_LABELS, EVENTS, EvidenceKey, GameAction,
@@ -109,10 +109,11 @@ export default function Home(){
   const [detail,setDetail]=useState(false);
   const [muted,setMuted]=useState(false);
   const [tab,setTab]=useState<"actions"|"people"|"log">("actions");
-  const [hasSave,setHasSave]=useState(false);
+  const [createdSave,setCreatedSave]=useState(false);
+  const existingSave=useSyncExternalStore(()=>()=>{},()=>Boolean(localStorage.getItem("lab-life-save")),()=>false);
+  const hasSave=createdSave||existingSave;
   const candidates=useMemo(()=>makeCandidates(seed),[seed]);
 
-  useEffect(()=>{ const frame=requestAnimationFrame(()=>setHasSave(Boolean(localStorage.getItem("lab-life-save"))));return()=>cancelAnimationFrame(frame); },[]);
   useEffect(()=>{ if(state && screen==="game") localStorage.setItem("lab-life-save",JSON.stringify(state)); },[state,screen]);
 
   const sound=(kind:"click"|"success"|"fail")=>{
@@ -124,7 +125,7 @@ export default function Home(){
     const rng=rngFrom(seed);
     const advisor=ADVISORS[Math.floor(rng()*ADVISORS.length)]; const project=PROJECTS[Math.floor(rng()*PROJECTS.length)];
     const fresh:GameState={ seed,candidate,advisor,project,week:1,resources:{energy:82,san:candidate.trait.includes("夜行")?65:76,funding:78,trust:52},stats:{...candidate.stats},evidence:{...EMPTY_EVIDENCE},familiarity:{},figures:0,manuscript:0,integrity:100,relation:30,debt:0,failures:0,experiments:0,negative:0,minSan:76,flags:[],logs:[{week:1,title:"研一·入学",text:`加入 ${advisor.name} 课题组，接手课题《${project.title}》。`,type:"start"}],journal:"",reviewStatus:"none",revision:0,submissions:0};
-    setState(fresh);setHasSave(true);setScreen("game");setSchedule([null,null,null,null,null]);sound("success");
+    setState(fresh);setCreatedSave(true);setScreen("game");setSchedule([null,null,null,null,null]);sound("success");
   };
 
   const continueRun=()=>{ try{const raw=localStorage.getItem("lab-life-save");if(raw){setState(JSON.parse(raw));setScreen("game");}}catch{ /* Ignore malformed local saves. */ } };
