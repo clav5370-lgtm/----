@@ -1,316 +1,249 @@
 "use client";
 
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
-import Image from "next/image";
+import { Component, useEffect, useState, type ErrorInfo, type ReactNode } from "react";
 import {
-  ACTIONS, ADVISORS, Candidate, EVIDENCE_LABELS, EVENTS, EvidenceKey, GameAction,
-  JOURNALS, NPCS, PROJECTS, RESOURCE_LABELS, ResourceKey, STAT_LABELS, StatKey, StoryEvent,
-} from "./game-data";
+  ACTIVITIES, ADVISORS, CANDIDATES, ENDINGS, EVIDENCE_LABELS, EVENTS, EXPERIMENTS,
+  GRADUATION_RULES, JOURNALS, RESEARCH_PROGRAMS, STAT_LABELS,
+} from "./game/content";
+import {
+  applyEventChoice, autoFillPlan, clearPlan, createRun, evaluateGraduation,
+  finishRun, getActiveAdvisorDemand, getCandidateSet, getPhase, getProjectChoices, nextExperimentSuggestions, paperQuality, planCapacity, plannedSlots,
+  removePlanItem, resolveTurn, scheduleActivity, scheduleExperiment, setOvertime, startParallelProject,
+  startNextProject, submitManuscript, submitReviewResponse, switchProject, technicalSuccessBreakdown, turnLabel, withdrawManuscript, getNextProjectChoices, journalSubmissionGaps,
+} from "./game/engine";
+import { type ActivityId, type Candidate, type GameStateV4, type ProjectDefinition, type ProjectSetup, type TurnResult } from "./game/types";
+import { hasSavedGame, loadGameState, saveGameState } from "./game/storage";
+import {
+  activityText, advisorText, candidateText, CHINESE_JOURNAL_EN, choiceText, endingText,
+  EVIDENCE_EN, eventText, experimentText, freeText, journalProfile, LanguageToggle,
+  LocaleProvider, memberText, programText, projectText, SCOPE_EN, STAT_EN, useLocale,
+  type Locale,
+} from "./game/i18n";
+import ExperimentCenter from "./components/experiment-center/ExperimentCenter";
+import { resolveFailureIncident } from "./game/experiments/failure-engine";
 
-type Outcome = "清晰阳性" | "弱阳性" | "阴性结果" | "矛盾结果" | "技术失败" | "意外发现";
-type RunLog = { week: number; title: string; text: string; type: string };
-type GameState = {
-  seed: number;
-  candidate: Candidate;
-  advisor: (typeof ADVISORS)[number];
-  project: (typeof PROJECTS)[number];
-  week: number;
-  resources: Record<ResourceKey, number>;
-  stats: Record<StatKey, number>;
-  evidence: Record<EvidenceKey, number>;
-  familiarity: Record<string, number>;
-  figures: number;
-  manuscript: number;
-  integrity: number;
-  relation: number;
-  debt: number;
-  failures: number;
-  experiments: number;
-  negative: number;
-  minSan: number;
-  flags: string[];
-  logs: RunLog[];
-  journal: string;
-  reviewStatus: "none" | "revision" | "accepted" | "rejected";
-  revision: number;
-  submissions: number;
-};
-type ResultRow = { icon: string; name: string; result: string; detail: string; tone: string };
-type Modal =
-  | { type: "results"; rows: ResultRow[]; nextEvent?: StoryEvent; milestone?: "proposal" | "midterm" }
-  | { type: "event"; event: StoryEvent }
-  | { type: "panel"; panel: "proposal" | "midterm" | "defense" }
-  | { type: "journal" }
-  | { type: "review"; decision: string; requirements: string[] }
-  | { type: "report"; ending: string };
+const LOCALE_KEY = "lab-life-language";
+// Legacy local save keys remain supported by ./game/storage: lab-life-v6-local, lab-life-v5-local, lab-life-v4-local, lab-life-save.
+type Screen = "menu" | "candidate" | "setup" | "game";
+type Tab = "library" | "people" | "papers" | "log";
+type LibrarySection = "center" | "pilot" | "formal" | "omics" | "paper" | "life";
+type Modal = "results" | "journals" | "next" | "review" | "guide" | null;
 
-const EMPTY_EVIDENCE: Record<EvidenceKey, number> = { phenotype:0, biochemical:0, histology:0, mechanism:0, rescue:0, replication:0 };
-const FIRST_NAMES = ["林晓满","周一鸣","陈若水","高飞","唐可可","李思源","沈星池","陆九月","陈默","方糖"];
-const BACKGROUNDS = ["本专业保研生","跨专业考研生","调剂上岸生","本科科研达人","零实验经验","数学背景转行","实验室老油条"];
-const BIOS = ["手很稳，但看到 R 就开始困。","相信一切问题都可以用脚本解决。","擅长说服别人，不擅长说服自己早睡。","理论像一座山，移液枪像一堵墙。","普通得令人安心，也因此最不可预测。"];
-const TRAITS = ["手稳·实验失败保护","数据直觉·异常也有价值","越挫越勇·连败后成功率提升","夜行动物·低精力惩罚减弱","文献雷达·更快解锁机制","咖啡因体质·摸鱼多回精力"];
-const FLAWS = ["社恐·求助收益降低","拖延症·前期写作效率低","玻璃心·批评额外损失 SAN","手残·精密实验风险提高","不会拒绝·人情债增长更快"];
+const asSetup = (project: ProjectDefinition): ProjectSetup => ({ ...project, definitionId:project.id, mode:"base" });
+const money = (value:number) => `${value < 0 ? "-¥" : "¥"}${Math.abs(Math.round(value))}k`;
+const engineError = (result: { ok:boolean; error?:string }) => result.error ?? "当前操作无法完成。";
 
-function rngFrom(seed: number) {
-  let t = seed;
-  return () => {
-    t += 0x6d2b79f5; let n = t;
-    n = Math.imul(n ^ (n >>> 15), n | 1); n ^= n + Math.imul(n ^ (n >>> 7), n | 61);
-    return ((n ^ (n >>> 14)) >>> 0) / 4294967296;
-  };
+const LIBRARY_SECTIONS: Array<{id:LibrarySection;label:string;hint:string;experiments:string[];activities:ActivityId[]}> = [
+  {id:"center",label:"V7 实验中心",hint:"按细胞/动物路线和研究阶段组织实验，默认不平铺旧实验库。",experiments:[],activities:[]},
+  {id:"pilot",label:"预实验",hint:"这里只做小规模条件摸索和查文献，不产生正式论文证据。",experiments:[],activities:["pilot","literature"]},
+  {id:"formal",label:"正式实验",hint:"按小类展开：从细胞表型到分子、动物和转化验证。",experiments:[],activities:[]},
+  {id:"omics",label:"测序与组学",hint:"从全局数据寻找机制；送测前至少要有一项成功实验。",experiments:["transcriptomics","proteomics","metabolomics","microbiome","single-cell","bioinformatics","multiomics"],activities:[]},
+  {id:"paper",label:"数据与论文",hint:"有数据后依次分析、画图、写稿；收到修回后还要单独回复审稿人。",experiments:[],activities:["analysis","figure","writing","review","thesis","grant"]},
+  {id:"life",label:"生活与师门",hint:"恢复状态或维护关系；找同门合作请进入课题组。",experiments:[],activities:["rest","games","travel"]},
+];
+
+const FORMAL_GROUPS = [
+  {id:"cell",label:"细胞实验",hint:"先建立处理体系，再检测活性、氧化应激、凋亡和细胞群变化。",experiments:["cell-study","cell-toxicity","ros","apoptosis","flow"]},
+  {id:"molecular",label:"分子检测",hint:"PCR看基因表达，Western blot验证蛋白和通路。",experiments:["pcr","wb"]},
+  {id:"animal",label:"动物实验",hint:"完成建模、分组、给药，再记录整体状态和生化指标。",experiments:["animal-model","clinical-monitor","biochem"]},
+  {id:"pathology",label:"病理检测",hint:"用病理切片和ELISA回答组织损伤与炎症指标是否改变。",experiments:["he","elisa"]},
+  {id:"translation",label:"毒理与转化",hint:"补充遗传毒性、暴露剂量、人源模型等高阶因果证据。",experiments:["genotoxicity","lcms","organoid"]},
+] as const;
+
+const LAB_SCENES = [
+  {name:"深夜细胞房",detail:"培养箱嗡嗡作响",position:"50% 52%",filter:"saturate(.8) hue-rotate(8deg) brightness(.72)",props:"🧫 · 🧪 · 🌙"},
+  {name:"清晨分子实验室",detail:"第一块胶正在跑",position:"28% 48%",filter:"saturate(.9) brightness(1.08)",props:"🧬 · ⚗️ · ☀️"},
+  {name:"动物房值班",detail:"今天轮到你记录体重",position:"75% 55%",filter:"sepia(.18) brightness(.86)",props:"🐁 · 📋 · 🥼"},
+  {name:"病理阅片室",detail:"显微镜下是另一座城市",position:"42% 63%",filter:"hue-rotate(300deg) saturate(.75)",props:"🔬 · ◉ · 🗂️"},
+  {name:"质谱平台",detail:"进样队列排到了凌晨",position:"68% 42%",filter:"hue-rotate(170deg) saturate(.7) brightness(.8)",props:"⚙️ · ⌬ · 📈"},
+  {name:"测序中心",detail:"样本质控刚刚通过",position:"22% 58%",filter:"hue-rotate(210deg) saturate(.92)",props:"🧬 · 💾 · ✣"},
+  {name:"导师办公室门口",detail:"手里的数据突然变得沉重",position:"82% 50%",filter:"sepia(.4) contrast(1.08)",props:"📄 · ☕ · 🚪"},
+  {name:"周会会议室",detail:"下一页就是你的进度",position:"54% 38%",filter:"grayscale(.12) contrast(1.12)",props:"📊 · 📽️ · 😶"},
+  {name:"类器官平台",detail:"三维培养正在慢慢成形",position:"33% 46%",filter:"hue-rotate(275deg) saturate(1.15)",props:"◍ · 🫧 · 🧫"},
+  {name:"雨夜实验楼",detail:"走廊只剩这一间亮着",position:"60% 66%",filter:"hue-rotate(185deg) brightness(.62) saturate(.7)",props:"🌧️ · 🏢 · 💡"},
+  {name:"论文冲刺角",detail:"图三还差最后一个重复",position:"15% 40%",filter:"sepia(.22) brightness(.92)",props:"💻 · ✎ · ☕"},
+  {name:"毕业季空实验室",detail:"有人离组，也有人刚来",position:"88% 61%",filter:"saturate(.6) brightness(1.14)",props:"📦 · 🎓 · 🌱"},
+];
+
+const projectProblem = (project: Pick<ProjectDefinition,"question">,locale:Locale) => locale==="en-US"?`Research question: ${project.question}`:`想解决的问题：${project.question}`;
+
+function GuideModal({onClose}:{onClose:()=>void}) {
+  const {t}=useLocale();
+  const steps=[[t("看顶部“目前进展”","Read Current Progress"),t("先读系统的白话总结，知道已经获得哪些证据。","Start with the plain-language summary of evidence already collected.")],[t("看“下一步建议”","Check Next-Step Suggestions"),t("点击建议会自动跳到对应实验分类，不熟悉技术也能继续。","A suggestion jumps directly to the right experiment, even if the technique is unfamiliar.")],[t("选择行动","Choose Actions"),t("悬停卡片查看成功率由哪些人物数值和状态组成。","Hover over a card to see how skills and current status change success.")],[t("排满两周时间格","Fill the Two-Week Schedule"),t("每回合基础 5 格；跨回合项目下周自动续排，0 精力时先休息。","Each turn has 5 base slots. Long projects carry over; rest first at zero energy.")],[t("执行并读结果","Resolve and Read Results"),t("数据完成后按“分析 → 画图 → 写稿”推进；外审意见会变成具体任务。","After collecting data, analyze, make figures, and write. Reviews become concrete tasks.")]];
+  return <div className="modal-layer"><section className="modal guide-modal"><button className="close" onClick={onClose}>×</button><p className="eyebrow">NEW PLAYER GUIDE · {t("逐步引导","STEP BY STEP")}</p><h2>{t("按这五步完成第一回合","Complete Your First Turn in Five Steps")}</h2><div className="guide-steps">{steps.map(([title,body],index)=><article key={title}><b>{index+1}</b><div><h3>{title}</h3><p>{body}</p></div></article>)}</div><button className="primary full" onClick={onClose}>{t("明白了，开始科研","Got It — Start Research")}</button></section></div>;
 }
 
-function makeCandidates(seed: number): Candidate[] {
-  const rng = rngFrom(seed);
-  return [0,1,2].map((i) => {
-    const focus = (Math.floor(rng()*5)+i)%5;
-    const weak = (focus+2+Math.floor(rng()*2))%5;
-    const keys: StatKey[] = ["wet","data","writing","theory","social"];
-    const values = keys.map((_,idx) => Math.max(18,Math.min(92,42+Math.floor(rng()*22)+(idx===focus?25:0)-(idx===weak?23:0))));
-    return {
-      name:FIRST_NAMES[(Math.floor(rng()*FIRST_NAMES.length)+i)%FIRST_NAMES.length],
-      background:BACKGROUNDS[Math.floor(rng()*BACKGROUNDS.length)], bio:BIOS[Math.floor(rng()*BIOS.length)],
-      stats:Object.fromEntries(keys.map((key,idx)=>[key,values[idx]])) as Record<StatKey,number>,
-      trait:TRAITS[Math.floor(rng()*TRAITS.length)], flaw:FLAWS[Math.floor(rng()*FLAWS.length)],
-      avatar:["🧪","🧬","💻"][i],
-    };
-  });
+function TitleMark() {
+  const {t}=useLocale();return <div className="title-mark"><b>λ</b><span>{t("实验室摸鱼模拟器","LAB LIFE SIMULATOR")}<small>LAB LIFE · PUBLISH OR PERISH</small></span></div>;
 }
 
-function clamp(value:number,min=0,max=100){ return Math.max(min,Math.min(max,value)); }
-function phaseFor(week:number,state:GameState){
-  if(state.reviewStatus==="accepted") return "毕业冲刺";
-  if(state.reviewStatus==="revision") return "Reviewer 修回";
-  if(state.manuscript>=3) return "论文与投稿";
-  if(week>=9) return "数据整合";
-  if(week>=5) return "正式实验";
-  return "预实验";
-}
-function evidenceTotal(e:Record<EvidenceKey,number>){ return Object.values(e).reduce((a,b)=>a+b,0); }
-function evidenceUnique(e:Record<EvidenceKey,number>){ return Object.values(e).filter(v=>v>0).length; }
-function paperQuality(state:GameState){ return Math.round(evidenceUnique(state.evidence)*7 + Math.min(12,evidenceTotal(state.evidence)*2) + state.figures*4 + state.manuscript*3 + state.stats.writing*.12 + state.project.novelty*.12 + state.integrity*.06); }
-
-function ResourceBars({state}:{state:GameState}){
-  return <div className="resource-strip">{(Object.keys(RESOURCE_LABELS) as ResourceKey[]).map(key=>{
-    const raw=state.resources[key]; const pct=key==="funding"?raw:clamp(raw); return <div className="resource" key={key}>
-      <div className="resource-head"><span>{RESOURCE_LABELS[key].icon} {RESOURCE_LABELS[key].name}</span><strong>{key==="funding"?`¥${raw}k`:raw}</strong></div>
-      <i><b className={`${key} ${raw<25?"danger":""}`} style={{width:`${pct}%`}} /></i>
-    </div>;
-  })}</div>;
-}
-
-export default function Home(){
-  const [seed,setSeed]=useState(240731);
-  const [screen,setScreen]=useState<"start"|"game">("start");
-  const [selected,setSelected]=useState<number|null>(null);
-  const [state,setState]=useState<GameState|null>(null);
-  const [schedule,setSchedule]=useState<(GameAction|null)[]>([null,null,null,null,null]);
-  const [modal,setModal]=useState<Modal|null>(null);
-  const [detail,setDetail]=useState(false);
-  const [muted,setMuted]=useState(false);
-  const [tab,setTab]=useState<"actions"|"people"|"log">("actions");
-  const [createdSave,setCreatedSave]=useState(false);
-  const existingSave=useSyncExternalStore(()=>()=>{},()=>Boolean(localStorage.getItem("lab-life-save")),()=>false);
-  const hasSave=createdSave||existingSave;
-  const candidates=useMemo(()=>makeCandidates(seed),[seed]);
-
-  useEffect(()=>{ if(state && screen==="game") localStorage.setItem("lab-life-save",JSON.stringify(state)); },[state,screen]);
-
-  const sound=(kind:"click"|"success"|"fail")=>{
-    if(muted)return;
-    try{ const AudioCtx=window.AudioContext || (window as unknown as {webkitAudioContext:typeof AudioContext}).webkitAudioContext; const ctx=new AudioCtx(); const o=ctx.createOscillator(); const g=ctx.createGain(); o.type="square"; o.frequency.value=kind==="success"?620:kind==="fail"?150:330; g.gain.setValueAtTime(.035,ctx.currentTime); g.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+.1); o.connect(g);g.connect(ctx.destination);o.start();o.stop(ctx.currentTime+.11); }catch{ /* Audio is optional. */ }
-  };
-
-  const startRun=(candidate:Candidate)=>{
-    const rng=rngFrom(seed);
-    const advisor=ADVISORS[Math.floor(rng()*ADVISORS.length)]; const project=PROJECTS[Math.floor(rng()*PROJECTS.length)];
-    const fresh:GameState={ seed,candidate,advisor,project,week:1,resources:{energy:82,san:candidate.trait.includes("夜行")?65:76,funding:78,trust:52},stats:{...candidate.stats},evidence:{...EMPTY_EVIDENCE},familiarity:{},figures:0,manuscript:0,integrity:100,relation:30,debt:0,failures:0,experiments:0,negative:0,minSan:76,flags:[],logs:[{week:1,title:"研一·入学",text:`加入 ${advisor.name} 课题组，接手课题《${project.title}》。`,type:"start"}],journal:"",reviewStatus:"none",revision:0,submissions:0};
-    setState(fresh);setCreatedSave(true);setScreen("game");setSchedule([null,null,null,null,null]);sound("success");
-  };
-
-  const continueRun=()=>{ try{const raw=localStorage.getItem("lab-life-save");if(raw){setState(JSON.parse(raw));setScreen("game");}}catch{ /* Ignore malformed local saves. */ } };
-  const addAction=(action:GameAction)=>{ const idx=schedule.findIndex(x=>!x);if(idx<0)return;sound("click");setSchedule(prev=>prev.map((v,i)=>i===idx?action:v)); };
-  const removeAction=(idx:number)=>{sound("click");setSchedule(prev=>prev.map((v,i)=>i===idx?null:v));};
-  const isUnlocked=(action:GameAction)=> !action.requires || Boolean(state?.evidence[action.requires]);
-
-  const resolveWeek=()=>{
-    if(!state || schedule.some(x=>!x))return;
-    const next:GameState=structuredClone(state); const rows:ResultRow[]=[]; const weekSeed=state.seed+state.week*997+state.experiments*31; const rng=rngFrom(weekSeed);
-    for(const item of schedule as GameAction[]){
-      if(item.kind==="recovery"){
-        const sanGain=item.id==="sleep"?19:13; const energyGain=item.id==="sleep"?22:11+(next.candidate.trait.includes("咖啡因")?5:0);
-        next.resources.energy=clamp(next.resources.energy+energyGain);next.resources.san=clamp(next.resources.san+sanGain);
-        if(item.id==="games" && next.week>=12) next.resources.trust=clamp(next.resources.trust-2);
-        rows.push({icon:item.icon,name:item.name,result:"恢复完成",detail:`精力 +${energyGain}·SAN +${sanGain}`,tone:"good"});continue;
-      }
-      next.resources.energy=clamp(next.resources.energy-item.cost); next.resources.funding=clamp(next.resources.funding-item.funding);
-      if(item.id==="literature"){
-        next.stats.theory=clamp(next.stats.theory+(rng()>.55?2:1));next.resources.san=clamp(next.resources.san-2);
-        rows.push({icon:item.icon,name:item.name,result:next.stats.theory>55?"找到了关键缺口":"补完了知识地图",detail:`理论能力提升·当前 ${next.stats.theory}`,tone:"good"});continue;
-      }
-      if(item.id==="analysis"){
-        const good=rng()<(next.stats.data/110+.18); if(good){next.figures+=1;next.stats.data=clamp(next.stats.data+1);}
-        else next.resources.san=clamp(next.resources.san-5);
-        rows.push({icon:item.icon,name:item.name,result:good?`Figure ${next.figures} 完成`:"脚本报错到深夜",detail:good?"数据已进入论文结构":"未产生可用 Figure",tone:good?"good":"bad"});continue;
-      }
-      if(item.id==="writing"){
-        const gain=Math.max(1,Math.floor(next.stats.writing/35)-(next.candidate.flaw.includes("拖延")&&next.week<10?1:0));next.manuscript=Math.min(8,next.manuscript+gain);
-        next.stats.writing=clamp(next.stats.writing+1);rows.push({icon:item.icon,name:item.name,result:["标题文件已建立","方法学有了骨架","结果串成了故事","初稿逐渐完整"][Math.min(3,next.manuscript-1)]||"稿件继续完善",detail:`稿件完成度 ${Math.min(100,next.manuscript*14)}%`,tone:"good"});continue;
-      }
-      if(item.id==="senior"){
-        const gain=next.candidate.flaw.includes("社恐")?5:10;next.relation=clamp(next.relation+gain);next.debt+=1;next.stats.social=clamp(next.stats.social+1);
-        if(next.evidence.mechanism===0&&next.evidence.biochemical>0)next.familiarity.mechanism=(next.familiarity.mechanism||0)+15;
-        rows.push({icon:item.icon,name:item.name,result:"师兄在本子上画了一张图",detail:`关系 +${gain}·人情债 +1`,tone:"good"});continue;
-      }
-      if(item.id==="funding"){
-        const grant=16+Math.floor(next.resources.trust/8);next.resources.funding=clamp(next.resources.funding+grant);next.resources.trust=clamp(next.resources.trust-2);next.stats.social=clamp(next.stats.social+1);
-        rows.push({icon:item.icon,name:item.name,result:"导师批了一小笔机动经费",detail:`经费 +¥${grant}k·导师期待 ↑`,tone:"good"});continue;
-      }
-      next.experiments+=1;
-      const fam=next.familiarity[item.id]||0; const fatigue=(100-next.resources.energy)/260; const badLuck=next.failures>=3?.18:0; const steady=next.candidate.trait.includes("手稳")?.08:0; const clumsy=next.candidate.flaw.includes("手残")?.08:0;
-      const success=clamp(.18+next.stats[item.skill]/145+fam/300-fatigue+badLuck+steady-clumsy,.18,.88);const roll=rng(); let outcome:Outcome;
-      if(roll<success*.55)outcome="清晰阳性";else if(roll<success)outcome="弱阳性";else if(roll<success+.13)outcome="阴性结果";else if(roll<success+.2)outcome="矛盾结果";else if(roll>.97)outcome="意外发现";else outcome="技术失败";
-      next.familiarity[item.id]=Math.min(100,fam+12);next.stats.wet=clamp(next.stats.wet+1);
-      if(outcome==="清晰阳性"||outcome==="意外发现"){ if(item.evidence)next.evidence[item.evidence]+=1;next.failures=0;next.resources.trust=clamp(next.resources.trust+2); }
-      else if(outcome==="弱阳性"){ if(item.evidence && next.evidence[item.evidence]===0)next.evidence[item.evidence]=1;next.failures=0; }
-      else if(outcome==="阴性结果"||outcome==="矛盾结果"){next.negative+=1;next.resources.san=clamp(next.resources.san-4);next.failures=0;}
-      else {next.failures+=1;next.resources.san=clamp(next.resources.san-7);if(next.candidate.trait.includes("越挫"))next.familiarity[item.id]+=8;}
-      rows.push({icon:item.icon,name:item.name,result:outcome,detail:detail?`成功率 ${Math.round(success*100)}%·熟练度 ${next.familiarity[item.id]}%`:outcome==="技术失败"?"试剂、手法或样本都可能是原因":outcome==="阴性结果"?"假说没有得到支持，但路线更清晰了":"证据已写入项目树",tone:outcome==="技术失败"?"bad":outcome.includes("阴")||outcome.includes("矛盾")?"neutral":"good"});
-    }
-    next.week+=1;next.resources.san=clamp(next.resources.san-(next.week>12?2:0));next.minSan=Math.min(next.minSan,next.resources.san);
-    if(next.reviewStatus==="revision")next.revision+=schedule.filter(x=>x&&["research","analysis","writing"].includes(x.kind)).length;
-    next.logs.push({week:state.week,title:`Week ${state.week} · ${phaseFor(state.week,state)}`,text:rows.map(r=>`${r.name}：${r.result}`).join("；"),type:"week"});
-    const nextEvent=chooseEvent(next,rng); const milestone=next.week===4?"proposal":next.week===8?"midterm":undefined;
-    setState(next);setSchedule([null,null,null,null,null]);setModal({type:"results",rows,nextEvent,milestone});sound(rows.some(r=>r.tone==="bad")?"fail":"success");
-  };
-
-  const chooseEvent=(s:GameState,rng:()=>number):StoryEvent|undefined=>{
-    if(s.week===2&&!s.flags.includes("antibody"))return EVENTS.find(e=>e.id==="antibody");
-    if(s.week>=6&&s.flags.includes("borrowed")&&!s.flags.includes("favor"))return EVENTS.find(e=>e.id==="favor");
-    const eligible=EVENTS.filter(e=>!["antibody","favor"].includes(e.id)&&!s.flags.includes(e.id));
-    return rng()<.62?eligible[Math.floor(rng()*eligible.length)]:undefined;
-  };
-
-  const closeResults=()=>{
-    if(modal?.type!=="results")return; const nextEvent=modal.nextEvent; const milestone=modal.milestone;
-    if(milestone)setModal({type:"panel",panel:milestone});else if(nextEvent)setModal({type:"event",event:nextEvent});else setModal(null);
-  };
-
-  const applyEvent=(event:StoryEvent,effect:string)=>{
-    if(!state)return;const next=structuredClone(state);next.flags.push(event.id);let log="";
-    switch(effect){
-      case"borrow":next.flags.push("borrowed");next.debt+=2;next.familiarity.mechanism=(next.familiarity.mechanism||0)+18;next.relation+=8;log="你借到了抗体，也记下了一笔人情。";break;
-      case"buy_self":next.resources.funding-=12;next.resources.trust+=2;log="你用经费换来了独立性。";break;
-      case"repay":next.resources.energy-=14;next.relation+=18;next.debt=Math.max(0,next.debt-2);log="清晨六点，你还掉了这笔人情债。";break;
-      case"refuse_favor":next.relation-=16;next.debt+=1;log="师兄回了一个“好”，没有表情。";break;
-      case"save_samples":next.resources.energy-=18;next.resources.trust+=10;next.relation+=8;log="样本保住了，你在凌晨见证了冰箱的沉默。";break;
-      case"trust_lab":if(next.seed%3===0){next.evidence.replication=Math.max(0,next.evidence.replication-1);next.resources.san-=12;log="样本化了一小部分，一次重复证据丢失。";}else{next.resources.san+=7;log="值班同门处理得很好。";}break;
-      case"ask_why":next.stats.theory+=3;next.resources.san-=next.candidate.flaw.includes("玻璃心")?12:7;log="你被追问了十分钟，但终于看懂了缺口。";break;
-      case"accept_critique":next.resources.trust+=5;next.resources.san-=5;next.familiarity.rescue=(next.familiarity.rescue||0)+15;log="批评变成了一张新实验设计图。";break;
-      case"eat":next.resources.san+=16;next.resources.energy+=10;next.relation+=5;log="这顿饭最终还是谈了 p 值，但你心情好多了。";break;
-      case"skip_lunch":next.figures+=1;next.resources.san-=8;log="胶跑得很直，你错过了免费甜品。";break;
-      case"race":next.project.novelty+=5;next.resources.san-=10;next.familiarity.rescue=(next.familiarity.rescue||0)+20;next.flags.push("scoop-risk");log="课题组进入了赛跑模式。";break;
-      case"pivot":next.project.mechanism=next.project.mechanism==="铁死亡"?"线粒体自噬":"铁死亡";next.project.novelty+=9;next.evidence.mechanism=0;log=`项目转向 ${next.project.mechanism}，机制证据需要重新建立。`;break;
-      case"milk_tea":next.resources.san+=17;next.relation+=7;log="奶茶杯被留在了工位上，当作小小的护身符。";break;
-      case"honest":next.integrity=100;next.resources.trust+=4;log="你报告了全部数据和预定剔除标准。";break;
-      case"hide_points":next.integrity-=32;next.manuscript+=1;next.flags.push("integrity-risk");log="图变好看了，但档案里多了一枚红旗。";break;
-      case"recover_drive":next.debt+=2;next.relation+=5;log="师姐用一根奇怪的转接线救回了 Figure 3。";break;
-      case"redo_analysis":next.resources.energy-=16;next.stats.data+=3;next.figures+=1;log="凌晨三点，你重做了 Figure 3，还找到了旧脚本的 bug。";break;
-      case"weekend_work":next.manuscript+=1;next.resources.san-=9;next.resources.trust+=3;log="这个周末被折叠进了一页幻灯片。";break;
-      case"weekend_rest":next.resources.san+=12;next.resources.trust-=2;log="你和手机保持了一天社交距离。";break;
-    }
-    next.resources.energy=clamp(next.resources.energy);next.resources.san=clamp(next.resources.san);next.resources.funding=clamp(next.resources.funding);next.resources.trust=clamp(next.resources.trust);next.relation=clamp(next.relation);next.stats={wet:clamp(next.stats.wet),data:clamp(next.stats.data),writing:clamp(next.stats.writing),theory:clamp(next.stats.theory),social:clamp(next.stats.social)};next.logs.push({week:next.week,title:event.title,text:log,type:"event"});next.minSan=Math.min(next.minSan,next.resources.san);setState(next);setModal(null);sound("click");
-  };
-
-  const finishPanel=(panel:"proposal"|"midterm"|"defense",choice:number)=>{
-    if(!state)return;const next=structuredClone(state);
-    if(panel==="proposal"){
-      const score=next.stats.theory+evidenceUnique(next.evidence)*10+choice*4;next.resources.trust=clamp(next.resources.trust+(score>65?7:-3));next.resources.san=clamp(next.resources.san-(score>65?4:10));next.flags.push("proposal-passed");next.logs.push({week:next.week,title:"开题答辩通过",text:score>65?"评审认为设计有逻辑，建议强化因果证据。":"陷险通过，需在两周内补交实验设计。",type:"milestone"});setState(next);setModal(null);
-    }else if(panel==="midterm"){
-      const stable=evidenceUnique(next.evidence)>=3;next.resources.trust=clamp(next.resources.trust+(stable?8:-7));next.resources.san=clamp(next.resources.san-(stable?3:12));next.flags.push("midterm-passed");next.logs.push({week:next.week,title:"中期考核通过",text:stable?"证据结构稳定，可以进入机制收口。":"被要求重新聚焦主线，但课题保留。",type:"milestone"});setState(next);setModal(null);
-    }else{
-      const q=paperQuality(next);let ending="顺利毕业";if(next.integrity<60)ending="带着秘密的毕业证";else if(q>=92&&next.resources.san>=45)ending="科研新星";else if(next.resources.san<25)ending="Reviewer Survivor";else if(next.logs.filter(l=>l.text.includes("摸鱼")).length>=3)ending="摸鱼宗师";next.logs.push({week:next.week,title:"毕业答辩通过",text:`委员会经讨论同意通过。结局：${ending}。`,type:"ending"});setState(next);setModal({type:"report",ending});sound("success");
-    }
-  };
-
-  const submit=(journal:(typeof JOURNALS)[number])=>{
-    if(!state)return;const next=structuredClone(state);const q=paperQuality(next);next.journal=journal.name;next.submissions+=1;let decision="Major Revision";if(q<journal.need-17)decision="Desk Reject";else if(q<journal.need-6)decision="Reject";else if(q>journal.need+18)decision="Minor Revision";
-    if(decision==="Desk Reject"||decision==="Reject"){next.reviewStatus="rejected";next.resources.san=clamp(next.resources.san-12);next.logs.push({week:next.week,title:`${journal.name}：${decision}`,text:"稿件被退回，但评论中藏着下一版的路线。",type:"review"});}
-    else{next.reviewStatus="revision";next.revision=0;next.logs.push({week:next.week,title:`${journal.name}：${decision}`,text:"审稿人要求补充统计说明、机制验证与 Figure 整合。",type:"review"});}
-    setState(next);setModal({type:"review",decision,requirements:decision.includes("Reject")?["补强证据结构","重写故事后可转投"]:["Reviewer 1·补充统计方法说明","Reviewer 2·增加机制或挽救实验","Reviewer 3·重组 Figure 并补充图注"]});sound(decision.includes("Reject")?"fail":"success");
-  };
-
-  const replyReview=()=>{
-    if(!state)return;const next=structuredClone(state);const success=next.revision>=3&&paperQuality(next)>=52;
-    next.reviewStatus=success?"accepted":"rejected";next.logs.push({week:next.week,title:success?"论文接收":"修回后仍被拒稿",text:success?`${next.journal} 发来了 Accept 邮件。`:"编辑认为核心问题仍未解决，可以转投。",type:"review"});next.resources.san=clamp(next.resources.san+(success?16:-12));next.resources.trust=clamp(next.resources.trust+(success?12:-3));setState(next);setModal({type:"review",decision:success?"Accept":"Reject after Revision",requirements:success?["你的证据链、图表和回应说服了编辑。","现在可以进入毕业答辩。"]:["证据链仍有缺口。","建议继续实验或选择更稳妥的期刊。"]});sound(success?"success":"fail");
-  };
-
-  if(screen==="start" || !state) return <StartScreen seed={seed} setSeed={setSeed} candidates={candidates} selected={selected} setSelected={setSelected} onStart={startRun} hasSave={hasSave} onContinue={continueRun} />;
-
-  const stage=phaseFor(state.week,state);const quality=paperQuality(state);const canSubmit=state.week>=10&&evidenceUnique(state.evidence)>=3&&state.figures>=2&&state.manuscript>=3;
-  return <main className="game-shell">
-    <header className="game-top">
-      <div className="mini-brand"><b>LL</b><span>实验室摸鱼模拟器</span></div>
-      <div className="clock"><span>YEAR {Math.min(3,Math.ceil(state.week/4))}</span><strong>WEEK {String(state.week).padStart(2,"0")}</strong><em>{stage}</em></div>
-      <div className="top-tools"><button onClick={()=>setDetail(v=>!v)} className={detail?"active":""}>详细模式</button><button onClick={()=>setMuted(v=>!v)}>{muted?"🔇":"🔊"}</button><button onClick={()=>{setScreen("start");setSelected(null);}}>保存并退出</button></div>
-    </header>
-    <ResourceBars state={state}/>
-
-    <div className="game-grid">
-      <aside className="profile-panel game-panel">
-        <div className="panel-label">RESEARCHER</div>
-        <div className="profile-head"><div className="avatar-pixel">{state.candidate.avatar}</div><div><h2>{state.candidate.name}</h2><p>{state.candidate.background}</p></div></div>
-        <div className="mini-stats">{(Object.keys(STAT_LABELS) as StatKey[]).map(key=><div key={key}><span>{STAT_LABELS[key]}</span><i><b style={{width:`${state.stats[key]}%`}} /></i><strong>{state.stats[key]}</strong></div>)}</div>
-        <div className="trait-box"><small>TRAIT</small><b>{state.candidate.trait.split("·")[0]}</b><p>{state.candidate.trait.split("·")[1]}</p></div>
-        <div className="advisor-card"><span>{state.advisor.icon}</span><div><small>ADVISOR·{state.advisor.visible}</small><b>{state.advisor.name}</b><p>信任度 {state.resources.trust}</p></div></div>
-        <div className="pressure"><span>当前压力</span><b>{Math.round((100-state.resources.san)*.55+(state.week>12?20:0))}</b><i><em style={{width:`${clamp((100-state.resources.san)*.55+(state.week>12?20:0))}%`}} /></i></div>
-      </aside>
-
-      <section className="lab-stage">
-        <Image src="/lab-evening.png" alt="像素风生物医学实验室晚间场景" fill sizes="(max-width: 760px) 100vw, 55vw" priority />
-        <div className="scene-vignette" />
-        <div className="scene-badge"><span>● {state.week%3===0?"23:41 · 深夜":"18:24 · 傍晚"}</span><b>{state.project.model}</b></div>
-        <div className="npc-float npc-one"><span>{NPCS[0].icon}</span><b>{NPCS[0].name}</b><small>{state.relation>60?"可以请求高级帮助":"正在跑胶"}</small></div>
-        <div className="lab-caption"><span>实验室·晚班</span><strong>{schedule.filter(Boolean).length===5?"本周计划已就绪":"把 5 个时间槽排满，然后开始这一周。"}</strong></div>
-      </section>
-
-      <aside className="project-panel game-panel">
-        <div className="panel-label">RESEARCH PROJECT</div>
-        <p className="project-code">RX-{state.seed.toString().slice(-4)} · 药理毒理</p><h3>{state.project.title}</h3>
-        <div className="hypothesis"><small>HYPOTHESIS</small><p>{state.project.compound} 可能通过<strong>{state.project.mechanism}</strong>缓解 {state.project.model}。</p></div>
-        <div className="evidence-tree">{(Object.keys(EVIDENCE_LABELS) as EvidenceKey[]).map((key,idx)=>{
-          const value=state.evidence[key];const locked=idx>0&&!Object.values(state.evidence).slice(0,idx).some(v=>v>0);return <div key={key} className={`evidence-node ${value?"done":""} ${locked?"locked":""}`}><span>{value?"✓":locked?"·":"○"}</span><div><b>{EVIDENCE_LABELS[key].name}</b><small>{value?`${value} 组可用证据`:EVIDENCE_LABELS[key].detail}</small></div></div>;
-        })}</div>
-        <div className="paper-meter"><span>论文潜力 <b>{quality<55?"LOW":quality<78?"SOLID":"HIGH"}</b></span><i><em style={{width:`${Math.min(100,quality)}%`}} /></i><small>{state.figures} Figures · 稿件 {Math.min(100,state.manuscript*14)}% · 完整性 {state.integrity}</small></div>
-        {state.reviewStatus==="revision"?<button className="project-cta" disabled={state.revision<3} onClick={replyReview}>回复 Reviewer · {state.revision}/3</button>:state.reviewStatus==="accepted"?<button className="project-cta success" disabled={state.week<12} onClick={()=>setModal({type:"panel",panel:"defense"})}>{state.week<12?`答辩材料准备中 · Week 12`:`参加毕业答辩 →`}</button>:<button className="project-cta" disabled={!canSubmit} onClick={()=>setModal({type:"journal"})}>{state.week<10?"投稿通道·Week 10 开放":state.reviewStatus==="rejected"?"重新选刊投稿":"准备投稿 →"}</button>}
-      </aside>
+function StartMenu({hasSave,onContinue,onNew}:{hasSave:boolean;onContinue:()=>void;onNew:()=>void}) {
+  const [guide,setGuide]=useState(false);const {t}=useLocale();
+  return <main className="start-screen">
+    <LanguageToggle/><div className="start-copy"><p className="eyebrow">{t("三年制深度课题版 · V6.2","THREE-YEAR RESEARCH CAREER · V6.2")}</p><h1>{t("实验室","LAB")}<br/><em>{t("摸鱼","LIFE")}</em>{t("模拟器"," SIMULATOR")}</h1><p>{t("一次实验需要经费、样本、精力和运气。","Every experiment needs funding, samples, energy, and luck.")}<br/>{t("一次毕业，需要三年、几篇论文，以及你还愿意继续的理由。","Graduation takes three years, several papers, and a reason to keep going.")}</p>
+      <div className="start-actions">{hasSave&&<button className="primary" onClick={onContinue}>{t("继续上次进度","Continue")}</button>}<button className={hasSave?"secondary":"primary"} onClick={onNew}>{t("开始新周目","Start New Run")}</button><button className="secondary" onClick={()=>setGuide(true)}>{t("玩法引导","How to Play")}</button></div>
+      <small className="save-hint">● {t("当前为纯本地版，进度自动保存在此设备。","This local build saves progress automatically on this device.")}</small>
     </div>
-
-    <section className="planner">
-      <div className="planner-tabs"><button className={tab==="actions"?"active":""} onClick={()=>setTab("actions")}>本周行动</button><button className={tab==="people"?"active":""} onClick={()=>setTab("people")}>同门关系</button><button className={tab==="log"?"active":""} onClick={()=>setTab("log")}>研究日志</button></div>
-      <div className="schedule-row"><div className="slot-title"><small>WEEK {state.week}</small><b>5 SLOTS</b></div>{schedule.map((item,idx)=><button key={idx} className={`week-slot ${item?item.kind:"empty"}`} onClick={()=>removeAction(idx)} aria-label={item?`移除${item.name}`:"空时间槽"}><span>{item?item.icon:String(idx+1)}</span><div><small>{["周一","周二","周三","周四","周五"][idx]}</small><b>{item?.short||"空闲"}</b></div>{item&&<em>×</em>}</button>)}<button className="execute" disabled={schedule.some(x=>!x)} onClick={resolveWeek}><span>执行本周</span><b>▶</b></button></div>
-      {tab==="actions"&&<div className="action-drawer">{ACTIONS.map(action=>{const unlocked=isUnlocked(action);return <button key={action.id} disabled={!unlocked||schedule.every(Boolean)} className={`action-card ${action.kind}`} onClick={()=>addAction(action)}><span>{action.icon}</span><div><b>{action.name}</b><small>{unlocked?action.desc:`需先获得${EVIDENCE_LABELS[action.requires!].name}`}</small></div><em>{action.cost<0?`+${-action.cost} 精力`:`-${action.cost} 精力`}</em></button>})}</div>}
-      {tab==="people"&&<div className="people-drawer">{NPCS.map((npc,i)=><div className="person" key={npc.name}><span>{npc.icon}</span><div><b>{npc.name}</b><small>{npc.role}</small></div><i><em style={{width:`${clamp(state.relation-i*8)}%`}} /></i><strong>{i===0?`TRUST ${state.relation}`:`AFFINITY ${clamp(state.relation-i*8)}`}</strong></div>)}<div className="debt-card"><small>FAVOR DEBT</small><b>{state.debt}</b><p>帮助不是免费的，但关系也不只是数字。</p></div></div>}
-      {tab==="log"&&<div className="log-drawer">{[...state.logs].reverse().slice(0,8).map((log,i)=><div className="log-item" key={`${log.week}-${i}`}><span>W{String(log.week).padStart(2,"0")}</span><div><b>{log.title}</b><p>{log.text}</p></div></div>)}</div>}
-    </section>
-
-    {modal&&<ModalLayer modal={modal} state={state} detail={detail} closeResults={closeResults} applyEvent={applyEvent} finishPanel={finishPanel} submit={submit} setModal={setModal}/>} 
+    <div className="start-board"><TitleMark/><div className="protocol"><span>RUN PROTOCOL / 001</span><strong>{t("两周只有 5 格。","Only 5 slots per two-week turn.")}</strong><p>{t("WB 固定占 5 格，单细胞要 12 格。你可以加班，但 SAN 不会替你还债。","Western blot uses 5 slots; single-cell sequencing uses 12. Overtime is possible, but SAN pays the bill.")}</p></div><div className="start-facts"><span><b>78</b>{t("回合才能答辩","turns before defense")}</span><span><b>12</b>{t("条连续研究线","connected research programs")}</span><span><b>60</b>{t("个深度课题","in-depth projects")}</span><span><b>24</b>{t("种结局","endings")}</span></div><div className="start-experiment-routes"><small>V7 EXPERIMENT CENTRE · {t("研究路线","RESEARCH ROUTES")}</small><span>🧫 {t("细胞实验","Cell Experiments")}</span><span>🐁 {t("动物实验","Animal Experiments")}</span></div></div>
+    {guide&&<GuideModal onClose={()=>setGuide(false)}/>}
   </main>;
 }
 
-function StartScreen({seed,setSeed,candidates,selected,setSelected,onStart,hasSave,onContinue}:{seed:number;setSeed:(n:number)=>void;candidates:Candidate[];selected:number|null;setSelected:(n:number|null)=>void;onStart:(c:Candidate)=>void;hasSave:boolean;onContinue:()=>void}){
-  return <main className="start-screen"><header className="topbar"><div className="brand-mark">LL</div><div><p className="eyebrow">LAB LIFE : PUBLISH OR PERISH</p><h1>实验室摸鱼模拟器 <i>· 毕业生存指南</i></h1></div><div className="seed-chip">SEED&nbsp; {seed}</div></header>
-    <section className="intro"><div><span className="chapter">01 / 入学报到</span><h2>选择你的<br/><em>研究生人生</em></h2></div><p>三封档案，三种命运。没有完美的开局，<br/>只有你愿意承担的弱项。</p></section>
-    <section className="candidate-grid" aria-label="研究生候选人">{candidates.map((c,index)=><button key={`${seed}-${c.name}`} className={`candidate-card ${selected===index?"selected":""}`} onClick={()=>setSelected(index)}><span className="card-index">0{index+1}</span><div className="portrait"><span>{c.avatar}</span></div><div className="identity"><h3>{c.name}</h3><span>{c.background}</span></div><p className="bio">“{c.bio}”</p><div className="stats">{(Object.keys(STAT_LABELS) as StatKey[]).map(key=><div className="stat" key={key}><span>{STAT_LABELS[key]}</span><i><b style={{width:`${c.stats[key]}%`}}/></i><strong>{c.stats[key]}</strong></div>)}</div><div className="tags"><span className="trait">+ {c.trait}</span><span className="flaw">− {c.flaw}</span></div><span className="choose-label">{selected===index?"已选定":"查看档案"}</span></button>)}</section>
-    <footer className="start-actions"><div>{hasSave&&<button className="continue" onClick={onContinue}>▶ 继续上次的研究生人生</button>}<button className="reroll" onClick={()=>{setSeed(Math.floor(Math.random()*900000)+100000);setSelected(null);}}>↻ 重新抽取命运</button></div><button className="begin" disabled={selected===null} onClick={()=>selected!==null&&onStart(candidates[selected])}><span>{selected===null?"请先选择一名研究生":`以 ${candidates[selected].name} 开始这一局`}</span><b>→</b></button></footer>
+function CandidateSelect({seed,refresh,onRefresh,onSelect,onMenu}:{seed:number;refresh:0|1;onRefresh:()=>void;onSelect:(candidate:Candidate)=>void;onMenu:()=>void}) {
+  const {locale,t}=useLocale();
+  return <main className="selection-screen"><LanguageToggle compact/><button className="text-button" onClick={onMenu}>← {t("返回主菜单","Main Menu")}</button><header><p className="eyebrow">STEP 01 / {t("12 名人物原型","12 CHARACTERS")}</p><h1>{t("这次，你会成为谁？","Who Will You Be This Time?")}</h1><p>{t("随机展示 3 人。只能刷新一次，且前后不重复。","Three characters appear at random. You may refresh once with no repeats.")}</p></header>
+    <section className="candidate-grid">{getCandidateSet(seed,refresh).map((candidate,index)=>{const copy=candidateText(candidate,locale);return <article className="candidate-card" key={candidate.id}><span className="card-number">0{index+1}</span><div className="avatar">{candidate.avatar}</div><p className="eyebrow">{copy.background}</p><h2>{copy.name}</h2><q>{copy.bio}</q><div className="stat-list">{Object.entries(candidate.stats).map(([key,value])=><div key={key}><span>{locale==="en-US"?STAT_EN[key as keyof typeof STAT_EN]:STAT_LABELS[key as keyof typeof STAT_LABELS]}</span><i><b style={{width:`${value}%`}}/></i><strong>{value}</strong></div>)}</div><div className="trait positive"><b>{copy.trait}</b><span>{copy.traitEffect}</span></div><div className="trait negative"><b>{copy.flaw}</b><span>{copy.flawEffect}</span></div><button className="primary full" onClick={()=>onSelect(candidate)}>{t("选择","Choose")} {copy.name}</button></article>})}</section>
+    <button className="refresh" disabled={refresh===1} onClick={onRefresh}>{refresh===0?t("↻ 使用唯一一次刷新","↻ Use Your Only Refresh"):t("刷新机会已使用","Refresh Used")}</button>
   </main>;
 }
 
-function ModalLayer({modal,state,detail,closeResults,applyEvent,finishPanel,submit,setModal}:{modal:Modal;state:GameState;detail:boolean;closeResults:()=>void;applyEvent:(e:StoryEvent,x:string)=>void;finishPanel:(p:"proposal"|"midterm"|"defense",c:number)=>void;submit:(j:(typeof JOURNALS)[number])=>void;setModal:(m:Modal|null)=>void}){
-  if(modal.type==="results")return <div className="modal-wrap"><div className="modal result-modal"><div className="modal-top"><span>WEEK {state.week-1} / EXECUTION REPORT</span><b>本周实验记录</b></div><div className="result-list">{modal.rows.map((row,i)=><div className={`result-row ${row.tone}`} style={{animationDelay:`${i*.06}s`}} key={i}><span>{row.icon}</span><div><small>{row.name}</small><b>{row.result}</b><p>{row.detail}</p></div><em>{row.tone==="good"?"DATA +":row.tone==="bad"?"CHECK":"NOTE"}</em></div>)}</div><div className="modal-summary"><span>项目证据 {evidenceTotal(state.evidence)}</span><span>Figures {state.figures}</span><span>SAN {state.resources.san}</span>{detail&&<span>失败保护 {state.failures}/3</span>}</div><button className="modal-next" onClick={closeResults}>{modal.milestone?"进入阶段考核":modal.nextEvent?"处理突发事件":"返回实验室"} →</button></div></div>;
-  if(modal.type==="event"){const e=modal.event;return <div className="modal-wrap"><div className={`modal event-modal ${e.tone}`}><div className="event-stripe">EVENT GRAPH · MEMORY ENABLED</div><div className="event-speaker"><span>{e.icon}</span><div><b>{e.speaker}</b><small>{e.role}</small></div></div><h2>{e.title}</h2><p className="event-text">{e.text}</p><div className="event-choices">{e.choices.map(choice=><button key={choice.effect} onClick={()=>applyEvent(e,choice.effect)}><span>{choice.label}</span><small>{choice.hint}</small><b>→</b></button>)}</div></div></div>}
-  if(modal.type==="panel"){const isDefense=modal.panel==="defense",isMid=modal.panel==="midterm";const title=isDefense?"毕业论文答辩":isMid?"研究生中期考核":"课题开题答辩";const question=isDefense?"你如何证明这不只是一条相关性通路？":isMid?"目前的证据结构能否支撑按期毕业？":"为什么选择这个模型，如何排除混杂因素？";return <div className="modal-wrap"><div className="modal panel-modal"><span className="panel-stamp">PANEL CHECK</span><h2>{title}</h2><p className="question">{question}</p><div className="panel-metrics"><span>理论 <b>{state.stats.theory}</b></span><span>证据 <b>{evidenceUnique(state.evidence)}/6</b></span><span>导师支持 <b>{state.resources.trust}</b></span></div><div className="panel-answers">{isMid?<><button onClick={()=>finishPanel("midterm",1)}><b>展示当前 Evidence Map</b><small>用证据结构而不是进度条回答</small></button></>:isDefense?<><button onClick={()=>finishPanel("defense",2)}><b>用挽救实验与独立重复回答</b><small>{state.evidence.rescue?"已解锁·因果证据充分":"证据不完整，但可以诚实说明局限"}</small></button><button onClick={()=>finishPanel("defense",0)}><b>坦诚说明局限与未来方向</b><small>不夸大结论，保持学术完整性</small></button></>:<><button onClick={()=>finishPanel("proposal",2)}><b>模型对应临床毒性，并设置阳性与载体对照</b><small>{state.stats.theory>=50?"已解锁·理论能力足够":"尝试用现有知识结构回答"}</small></button><button onClick={()=>finishPanel("proposal",0)}><b>这是导师选的模型</b><small>简洁，但委员会可能会继续追问</small></button></>}</div></div></div>}
-  if(modal.type==="journal")return <div className="modal-wrap"><div className="modal journal-modal"><span className="panel-stamp">PUBLICATION STRATEGY</span><h2>这篇论文要投去哪里？</h2><p>证据、新颖性和写作决定下限；选刊决定风险。</p><div className="quality-card"><span>PAPER QUALITY</span><b>{paperQuality(state)}</b><small>{evidenceUnique(state.evidence)} 类证据 · {state.figures} Figures · 完整性 {state.integrity}</small></div><div className="journal-list">{JOURNALS.map(j=><button key={j.name} onClick={()=>submit(j)}><i style={{background:j.color}}/><div><b>{j.name}</b><small>{j.tier}·期望证据强度 {j.need}</small></div><span>投稿 →</span></button>)}</div><button className="text-close" onClick={()=>setModal(null)}>再补点数据</button></div></div>;
-  if(modal.type==="review")return <div className="modal-wrap"><div className="modal review-modal"><div className="editor-head"><span>EDITOR DECISION</span><b className={modal.decision.includes("Accept")?"accept":""}>{modal.decision}</b><small>{state.journal}</small></div><h2>{modal.decision.includes("Reject")?"这不是结束，是另一版稿件的开始。":"审稿人给了你一份新实验清单。"}</h2><div className="requirements">{modal.requirements.map((r,i)=><div key={r}><span>0{i+1}</span><p>{r}</p></div>)}</div><button className="modal-next" onClick={()=>setModal(null)}>{modal.decision==="Accept"?"回实验室准备答辩":modal.decision.includes("Reject")?"回去整理证据":"开始修回计时"} →</button></div></div>;
-  return <div className="modal-wrap report-bg"><div className="modal report-modal"><div className="report-title"><span>RUN #{String(state.seed).slice(-3)}</span><h2>我的研究生人生</h2><b>{modal.ending}</b></div><div className="report-paper"><small>MANUSCRIPT</small><h3>{state.project.title}</h3><p>{state.journal} · {state.reviewStatus==="accepted"?"ACCEPTED":"GRADUATED"}</p></div><div className="report-grid"><div><span>毕业周数</span><b>{state.week}</b></div><div><span>实验总数</span><b>{state.experiments}</b></div><div><span>阴性结果</span><b>{state.negative}</b></div><div><span>投稿次数</span><b>{state.submissions}</b></div><div><span>最低 SAN</span><b>{state.minSan}</b></div><div><span>论文质量</span><b>{paperQuality(state)}</b></div></div><div className="timeline">{state.logs.filter(l=>["start","milestone","review","ending","event"].includes(l.type)).slice(-7).map((l,i)=><div key={i}><span>W{l.week}</span><p><b>{l.title}</b><small>{l.text}</small></p></div>)}</div><button className="modal-next" onClick={()=>{localStorage.removeItem("lab-life-save");location.reload();}}>再随机一个研究生 →</button></div></div>;
+function ProjectSetup({seed,candidate,onBack,onStart}:{seed:number;candidate:Candidate;onBack:()=>void;onStart:(setup:ProjectSetup)=>void}) {
+  const {locale,t}=useLocale();const person=candidateText(candidate,locale);
+  return <main className="setup-screen"><LanguageToggle compact/><button className="text-button" onClick={onBack}>← {t("重新选人","Choose Again")}</button><header className="setup-header"><div className="avatar small">{candidate.avatar}</div><div><p className="eyebrow">STEP 02 / {t("60 个真实研究课题","60 RESEARCH PROJECTS")}</p><h1>{person.name}，{t("三年要押在哪个问题上？","which question deserves three years?")}</h1><p>{t("首篇只会出现研究线第 1–2 阶段；后续论文可沿同一条线继续深入。","The first paper starts at stages 1–2; later papers can advance along the same program.")}</p></div></header>
+    <section className="project-grid">{getProjectChoices(seed).map(project=>{const copy=projectText(project,locale);const program=programText(RESEARCH_PROGRAMS.find(item=>item.id===project.programId)!,locale);return <article className="project-card" key={project.id}><span className="domain">{copy.domain} · {program.name} · {t("阶段","Stage")} {project.stage}</span><h2>{copy.title}</h2><p className="project-problem">{projectProblem(copy,locale)}</p><p className="project-gap">{copy.knowledgeGap}</p><dl><div><dt>{t("模型","Model")}</dt><dd>{copy.model}</dd></div><div><dt>{t("具体物质","Intervention")}</dt><dd>{copy.intervention}</dd></div><div><dt>{t("机制轴","Mechanism")}</dt><dd>{copy.mechanismAxis}</dd></div><div><dt>{t("路线","Route")}</dt><dd>{copy.route}</dd></div></dl><div className="project-meters"><span>{t("难度","Difficulty")} <b>{project.difficulty}</b></span><span>{t("新颖性","Novelty")} <b>{project.novelty}</b></span></div><button className="primary full" onClick={()=>onStart(asSetup(project))}>{t("接下课题","Take This Project")}</button></article>})}</section>
+  </main>;
+}
+
+function ResourceBar({state}:{state:GameStateV4}) {
+  const {t}=useLocale();const items=[{name:t("精力","Energy"),icon:"⚡",value:state.resources.energy},{name:"SAN",icon:"◑",value:state.resources.san},{name:t("导师信任","PI Trust"),icon:"◇",value:state.resources.trust},{name:t("经费","Funding"),icon:"¥",value:state.funding.balance,funding:true}];
+  return <section className="resource-bar">{items.map(item=><div key={item.name}><span>{item.icon} {item.name}</span><strong>{item.funding?money(item.value):item.value}</strong><i><b className={item.value<25?"danger":""} style={{width:`${item.funding?Math.max(0,Math.min(100,item.value/state.funding.initial*100)):item.value}%`}}/></i>{item.funding&&<small>{t(`可赊账至 -¥${state.funding.creditLimit}k`,`Credit limit −¥${state.funding.creditLimit}k`)}</small>}</div>)}</section>;
+}
+
+function LabScene({state}:{state:GameStateV4}) {
+  const {locale,t}=useLocale();const index=(state.seed+Math.floor((state.turn-1)/13))%LAB_SCENES.length;const scene=LAB_SCENES[index];const sceneEn=[["Midnight Cell Room","The incubator hums in the dark"],["Morning Molecular Lab","The first gel is running"],["Animal-Facility Shift","Today you record body weights"],["Pathology Reading Room","Another city under the microscope"],["Mass-Spectrometry Core","The injection queue runs past midnight"],["Sequencing Center","Sample QC just passed"],["Outside the PI's Office","The data in your hands suddenly feels heavier"],["Weekly Meeting Room","Your progress is on the next slide"],["Organoid Platform","The 3D culture slowly takes shape"],["Rainy Laboratory Night","Only one room remains lit"],["Manuscript Sprint Corner","Figure 3 needs one final repeat"],["Graduation-Season Lab","Some leave; others just arrived"]][index];
+  return <section className="lab-scene"><div className="lab-scene-image" style={{backgroundPosition:scene.position,filter:scene.filter}}/><div className="scene-grid"/><div className="scene-caption"><p className="eyebrow">PIXEL LAB · {t("本局场景","THIS RUN")}</p><h2>{locale==="en-US"?sceneEn[0]:scene.name}</h2><span>{locale==="en-US"?sceneEn[1]:scene.detail}</span></div><b className="scene-props">{scene.props}</b></section>;
+}
+
+function simpleProgress(state:GameStateV4,locale:Locale) {
+  const project=state.projects.find(item=>item.runId===state.currentProjectRunId)!;
+  const messages:string[]=[];
+  if(!project.experimentHistory.length)messages.push(locale==="en-US"?"No result yet: begin with a pilot or cell study.":"还没有实验结果：先做预实验或细胞实验。 ");
+  else {
+    if(project.evidence.phenotype)messages.push(locale==="en-US"?"A phenotype has emerged, suggesting the intervention may matter.":"已经看到表型变化，说明干预可能有效。 ");
+    if(project.evidence.biochemical)messages.push(locale==="en-US"?"Biochemical changes now quantify organ injury.":"生化指标已有变化，器官损伤有了定量依据。 ");
+    if(project.evidence.histology)messages.push(locale==="en-US"?"Histopathology supports a tissue-level change.":"病理切片支持组织层面的变化。 ");
+    if(project.evidence.molecular||project.evidence.mechanism)messages.push(locale==="en-US"?"A molecular or mechanistic lead is ready for causal validation.":"分子或机制线索已经出现，可以继续做因果验证。 ");
+    if(project.evidence.omics)messages.push(locale==="en-US"?"Omics provides a global lead; analyze it before selecting a mechanism.":"组学已经给出全局线索，下一步适合做组学分析。 ");
+    if(!project.evidence.replication)messages.push(locale==="en-US"?"The key result still needs an independent repeat.":"关键结果还缺独立重复，投稿时可能被质疑。 ");
+    if(project.figures===0)messages.push(locale==="en-US"?"Data exists but no figure does: analyze, then make a figure.":"已有数据但还没有 Figure：先数据分析，再论文画图。 ");
+    else if(project.writingProgress<55)messages.push(locale==="en-US"?"A usable figure exists; manuscript writing can begin.":"已有可用 Figure，可以开始推进论文写作。 ");
+  }
+  return messages.slice(0,3);
+}
+
+function Overview({state,onJournal,onReview,onNext,onSuggestion,onDefense,notify}:{state:GameStateV4;onJournal:()=>void;onReview:()=>void;onNext:()=>void;onSuggestion:(section:LibrarySection,id:string)=>void;onDefense:()=>void;notify:(text:string)=>void}) {
+  const {locale,t}=useLocale();const candidateRaw=CANDIDATES.find(item=>item.id===state.candidateId)!;const candidate=candidateText(candidateRaw,locale);const advisor=advisorText(ADVISORS.find(item=>item.id===state.advisorId)!,locale);const rule=GRADUATION_RULES.find(item=>item.id===state.graduationRuleId)!;const ruleEn:Record<string,[string,string]>={"two-sci":["Two SCI Papers","Publish two SCI papers."],"one-high":["One High-Level SCI Paper","Publish one high-level SCI paper."],"three-core":["Three Chinese Core Papers","Publish three verified Chinese core papers."],"mixed":["One SCI + One Chinese Core","Publish one SCI and one Chinese core paper."]};const rawProject=state.projects.find(item=>item.runId===state.currentProjectRunId)!;const project=projectText(rawProject,locale);const paper=state.manuscripts.find(item=>item.projectRunId===state.currentProjectRunId)!;const graduation=evaluateGraduation(state);const demand=getActiveAdvisorDemand(state);const suggestions=nextExperimentSuggestions(state);const running=state.activeExperiments.filter(run=>run.projectRunId===rawProject.runId);const ruleCopy=locale==="en-US"?(ruleEn[rule.id]??["Graduation Requirement","Meet the department's publication requirement."]):[rule.name,rule.description];
+  const paperStatus=paper.status==="draft"?t("草稿阶段","Draft stage"):paper.status==="under_review"?t(`外审中，第 ${paper.decisionTurn} 回合决定`,`Under review · decision on turn ${paper.decisionTurn}`):paper.status==="revision"?t(`修回任务 ${paper.reviewRequests.filter(item=>item.completed).length}/${paper.reviewRequests.length} · 回复信 ${paper.responseProgress}% · 截止第 ${paper.reviewDeadlineTurn} 回合`,`Revision ${paper.reviewRequests.filter(item=>item.completed).length}/${paper.reviewRequests.length} · response ${paper.responseProgress}% · due turn ${paper.reviewDeadlineTurn}`):paper.status==="rejected"?t("拒稿/撤稿，可补强后转投","Rejected/withdrawn · strengthen and resubmit"):t("论文已接收","Paper accepted");
+  return <section className="overview"><aside><div className="player-line"><span className="avatar mini">{candidate.avatar}</span><div><p className="eyebrow">PLAYER</p><h2>{candidate.name}</h2><small>{candidate.background}</small></div></div><div className="compact-stats">{Object.entries(state.stats).map(([key,value])=><div key={key}><span>{locale==="en-US"?STAT_EN[key as keyof typeof STAT_EN]:STAT_LABELS[key as keyof typeof STAT_LABELS]}</span><b>{value}</b></div>)}</div><div className="advisor-card"><span>{advisor.icon}</span><div><p className="eyebrow">{advisor.archetype}</p><h3>{advisor.name}</h3><small>{advisor.title} · {advisor.supervision}</small><div className="advisor-tags"><i>{advisor.honor}</i><i>{t("严格度","Strictness")}: {advisor.strictness}</i><i>{t("经费","Funding")}: {advisor.wealth}</i></div><q>{advisor.quote}</q></div></div><div className="graduation-rule"><p className="eyebrow">{t("本局院系要求","DEPARTMENT REQUIREMENT")}</p><b>{ruleCopy[0]}</b><span>{ruleCopy[1]}</span><small>{state.turn<78?t(`第 78 回合前不可答辩，还有 ${78-state.turn} 回合`,`Defense is locked for ${78-state.turn} more turns`):graduation.papers?t("成果条件达成","Publication requirement met"):t("成果条件未达成","Publication requirement not met")}</small></div>{demand&&<div className="advisor-demand"><p className="eyebrow">ADVISOR DEADLINE</p><b>{t("限时补做 3 项实验","Complete 3 Extra Experiments")}</b><span>{t(`还差 ${demand.remaining} 项·剩余 ${demand.turnsLeft} 回合`,`${demand.remaining} remaining · ${demand.turnsLeft} turns left`)}</span><i><em style={{width:`${Math.max(0,(1-demand.remaining/3)*100)}%`}}/></i></div>}</aside>
+    <article className="project-overview"><div className="project-heading"><div><p className="eyebrow">CURRENT PROJECT · {project.domain} · {t("研究线阶段","PROGRAM STAGE")} {project.stage}/5</p><h1>{project.title}</h1><span>{projectProblem(project,locale)}</span><small className="knowledge-gap">{project.knowledgeGap}</small></div><div className="quality"><b>{paperQuality(state)}</b><span>{t("论文质量","Paper Quality")}</span></div></div><div className="evidence-row">{Object.entries(rawProject.evidence).map(([key,value])=><div className={value?"complete":""} key={key}><span>{value?"✓":"·"}</span><b>{locale==="en-US"?EVIDENCE_EN[key as keyof typeof EVIDENCE_EN]:EVIDENCE_LABELS[key as keyof typeof EVIDENCE_LABELS]}</b><small>{value} {t("组","sets")}</small></div>)}</div><div className="progress-layers"><section><p className="eyebrow">① {t("已经完成","COMPLETED")}</p>{simpleProgress(state,locale).map((message,index)=><span key={index}>{message}</span>)}</section><section><p className="eyebrow">② {t("正在进行","IN PROGRESS")}</p>{running.length?running.map(run=>{const experiment=experimentText(EXPERIMENTS.find(item=>item.id===run.definitionId)!,locale);return <span key={run.id}>{state.resources.energy<=0?"⏸ ":"↻ "}{experiment.name} {run.completedSlots}/{run.totalSlots} {t("格","slots")}{state.resources.energy<=0?t(" · 精力耗尽，已暂停"," · paused: no energy"):""}</span>}):<span>{t("当前没有跨回合实验。","No cross-turn experiment is active.")}</span>}</section><section className="next-suggestions"><p className="eyebrow">③ {t("接下来可以做","NEXT STEPS")}</p>{suggestions.map(item=>{const experiment=EXPERIMENTS.find(exp=>exp.id===item.id);return <button key={item.id} onClick={()=>onSuggestion(item.section,item.id)}><b>{experiment?experimentText(experiment,locale).name:freeText(item.label,locale,"Recommended action")}</b><small>{locale==="en-US"?"Recommended because it fills the next evidence gap.":item.reason}</small></button>})}</section></div><div className="figure-coverage"><b>{t("主图已覆盖","Main-Figure Coverage")}</b>{rawProject.figureCoverage.length?rawProject.figureCoverage.map(key=><span key={key}>{locale==="en-US"?EVIDENCE_EN[key]:EVIDENCE_LABELS[key]}</span>):<span>{t("还没有主图","No main figure yet")}</span>}<small>{t("同类证据不会重复生成主图，最多6张。","One main figure per evidence type, up to six.")}</small></div><div className="project-numbers"><span>{t("主图","Figures")} <b>{rawProject.figures}/6</b></span><span>{t("稿件","Manuscript")} <b>{rawProject.writingProgress}%</b></span><span>{t("毕业论文","Thesis")} <b>{rawProject.thesisProgress}%</b></span><span>{t("压力","Pressure")} <b>{Math.round(state.pressure)}</b></span></div><div className="manuscript-action"><div><p className="eyebrow">MANUSCRIPT {state.manuscripts.findIndex(item=>item.id===paper.id)+1}</p><b>{paperStatus}</b></div>{["draft","rejected"].includes(paper.status)&&<button onClick={onJournal}>{t("选刊投稿","Choose Journal")}</button>}{paper.status==="under_review"&&state.projects.filter(item=>item.active).length<2&&<button onClick={onNext}>{t("外审期间准备下一篇","Start Paper 2 While Waiting")}</button>}{paper.status==="revision"&&<button onClick={onReview}>{t("查看修回策略","Revision Strategy")}</button>}{paper.status==="accepted"&&<button onClick={onNext}>{t("开启下一篇","Start Next Paper")}</button>}{state.turn>=78&&<button className="defense" onClick={()=>graduation.eligible?onDefense():notify(t(`尚未毕业：${!graduation.papers?rule.description:"毕业论文未完成"}`,`Not ready to graduate: ${!graduation.papers?ruleCopy[1]:"thesis incomplete"}`))}>{t("申请答辩","Request Defense")}</button>}</div>{paper.requirements.length>0&&<div className="review-notes">{paper.requirements.map(note=><p key={note}>{freeText(note,locale,"Reviewer request recorded. Complete the matching evidence or writing task.")}</p>)}</div>}</article>
+  </section>;
+}
+
+function Planner({state,onChange,notify,tab,setTab,section,setSection,formalGroup,setFormalGroup}:{state:GameStateV4;onChange:(state:GameStateV4)=>void;notify:(text:string)=>void;tab:Tab;setTab:(tab:Tab)=>void;section:LibrarySection;setSection:(section:LibrarySection)=>void;formalGroup:(typeof FORMAL_GROUPS)[number]["id"];setFormalGroup:(group:(typeof FORMAL_GROUPS)[number]["id"])=>void}) {
+  const {locale,t}=useLocale();
+  const addExperiment=(id:string)=>{const result=scheduleExperiment(state,id);if(result.ok)onChange(result.state);else notify(engineError(result));};
+  const addActivity=(id:ActivityId,targetId?:string)=>{const result=scheduleActivity(state,id,targetId);if(result.ok)onChange(result.state);else notify(engineError(result));};
+  const setExtra=(slots:0|1|2)=>{const result=setOvertime(state,slots);if(result.ok)onChange(result.state);else notify(engineError(result));};
+  const activeSection=LIBRARY_SECTIONS.find(item=>item.id===section)!;
+  const visibleExperiments=section==="formal"?FORMAL_GROUPS.find(item=>item.id===formalGroup)!.experiments:[...activeSection.experiments];
+  const currentPaper=state.manuscripts.find(item=>item.projectRunId===state.currentProjectRunId)!;
+  const carryovers=state.plan.filter(item=>item.locked);
+  const sectionEn:Record<LibrarySection,[string,string]>={center:["V7 Experiment Centre","Organize research by cell/animal route and stage; legacy libraries remain available below."],pilot:["Pilot Work","Optimize conditions and protocols before formal evidence."],formal:["Formal Experiments","Legacy formal library: cell phenotypes, molecular, animal, and translational validation."],omics:["Sequencing & Omics","Use global data to find mechanisms after preparing usable samples."],paper:["Data & Papers","Analyze, make figures, write, seek funding, and answer reviewers."],life:["Life & Lab","Recover your condition or manage lab relationships."]};
+  const groupEn:Record<string,[string,string]>={cell:["Cell Studies","Build a treatment system, then measure viability, stress, death, and cell populations."],molecular:["Molecular Assays","PCR measures genes; Western blot validates proteins and pathways."],animal:["Animal Studies","Model, randomize, dose, and collect whole-organism phenotypes."],pathology:["Pathology","Histology and ELISA quantify tissue injury and inflammation."],translation:["Toxicology & Translation","Add genotoxicity, exposure, and human-relevant evidence."]};
+  const pendingIncidents=state.pendingIncidents??[];
+  const resolveIncident=(incidentId:string,choiceId:string)=>{const result=resolveFailureIncident(state,incidentId,choiceId);if(result)onChange(result.state as GameStateV4);else notify(t("该事故已处理或选项无效。","This incident has already been resolved or the choice is invalid."));};
+  return <section className="planner">{pendingIncidents.length>0&&<div className="failure-workbench"><div><p className="eyebrow">{t("实验事故待处理","EXPERIMENT INCIDENT")}</p><h3>{t("结果出了问题：先决定如何处理","The result failed: decide how to handle it")}</h3></div>{pendingIncidents.map(incident=><article key={incident.id}><b>{freeText(incident.title,locale,"Experimental failure")}</b><p>{freeText(incident.reason,locale,"The result may be unreliable.")}</p><div>{incident.event.choices.map(choice=><button type="button" key={choice.id} onClick={()=>resolveIncident(incident.id,choice.id)}>{freeText(choice.label,locale,"Resolve")}</button>)}</div></article>)}</div>}<nav>{([['library',t('分类行动库','Action Library')],['people',t(`课题组 ${state.lab.filter(x=>x.active).length}`,`Lab ${state.lab.filter(x=>x.active).length}`)],['papers',t(`论文 ${state.manuscripts.length}`,`Papers ${state.manuscripts.length}`)],['log',t('日志','Log')]] as [Tab,string][]).map(([id,label])=><button className={tab===id?"active":""} onClick={()=>setTab(id)} key={id}>{label}</button>)}</nav><div className="planner-body">
+    {tab==="library"&&<><div className="library-tabs">{LIBRARY_SECTIONS.map(item=><button className={section===item.id?"active":""} onClick={()=>setSection(item.id)} key={item.id}>{locale==="en-US"?sectionEn[item.id][0]:item.label}</button>)}</div><p className="library-hint">{locale==="en-US"?sectionEn[activeSection.id][1]:activeSection.hint}</p>{section==="center"?<ExperimentCenter state={state} onChange={onChange} notify={notify}/>:<>{section==="formal"&&<div className="formal-groups">{FORMAL_GROUPS.map(group=><button className={formalGroup===group.id?"active":""} onClick={()=>setFormalGroup(group.id)} key={group.id}><b>{locale==="en-US"?groupEn[group.id][0]:group.label}</b><small>{locale==="en-US"?groupEn[group.id][1]:group.hint}</small></button>)}</div>}{carryovers.length>0&&<div className="carryover-notice"><b>↻ {t("跨回合任务已自动续排","CARRYOVER AUTO-SCHEDULED")}</b><span>{carryovers.map(item=>`${freeText(item.label,locale,"Continuing experiment")} ${item.slots} ${t("格","slots")}`).join(locale==="en-US"?"; ":"；")}{t("。这些格子已锁定，完成后会自动释放。",". These slots remain locked until completion.")}</span></div>}{state.resources.energy<=0&&<div className="energy-stop"><b>⚡ {t("精力为 0，实验已暂停","ZERO ENERGY — EXPERIMENTS PAUSED")}</b><span>{t("只能先安排休息、摸鱼、约会或旅行；恢复后跨回合项目会自动续排。","Only recovery actions are available. Carryover work resumes after energy returns.")}</span></div>}<div className="unified-grid">
+      {visibleExperiments.map(id=>EXPERIMENTS.find(item=>item.id===id)!).map(experiment=>{const copy=experimentText(experiment,locale);const breakdown=technicalSuccessBreakdown(state,experiment);return <article id={`action-${experiment.id}`} className="experiment-card explained-card" key={experiment.id}><div className="experiment-head"><span>{experiment.icon}</span><div><h3>{copy.name}</h3><small>{copy.equipment}</small></div><b>{Math.round(breakdown.chance*100)}%</b></div><p>{copy.description}</p><div className="badges"><span>{t("经费","Cost")} ¥{experiment.cost}k</span><span>{t("时间","Time")} {experiment.slots} {t("格","slots")}</span><span>{t("精力","Energy")} -{experiment.energy}</span></div><small className="sample">{t("需要","Needs")}: {copy.sample} · {t("产出","Output")}: {locale==="en-US"?EVIDENCE_EN[experiment.evidence]:EVIDENCE_LABELS[experiment.evidence]} {t("证据","evidence")}</small><button disabled={state.resources.energy<=0||(state.funding.balance<0&&experiment.cost>0)} onClick={()=>addExperiment(experiment.id)}>{state.resources.energy<=0?t("精力耗尽，先休息","Rest First"):experiment.slots>5?t("启动跨回合项目","Start Long Project"):t("排入这两周","Add to Schedule")}</button><div className="card-tooltip"><b>{t("它具体能做什么？","What Does It Answer?")}</b><span>{copy.description}</span><small>{t(`成功后补充“${EVIDENCE_LABELS[experiment.evidence]}”证据；失败不退经费。`,`Success adds ${EVIDENCE_EN[experiment.evidence]} evidence; failure does not refund funding.`)}</small><div className="chance-breakdown">{breakdown.factors.map((factor,index)=><i key={`${factor.label}-${index}`}><span>{freeText(factor.label,locale,"Skill/status modifier")}</span><b className={factor.value<0?"minus":""}>{factor.value>=0?"+":""}{Math.round(factor.value*100)}%</b></i>)}<strong>{t("最终","Final")} {Math.round(breakdown.chance*100)}%</strong></div></div></article>})}
+      {activeSection.activities.map(id=>{const activity=ACTIVITIES[id];const copy=activityText(id,activity,locale);const energyBlocked=state.resources.energy<=0&&!(["rest","games","date","travel"] as ActivityId[]).includes(id);const reviewBlocked=id==="review"&&currentPaper.status!=="revision";const blocked=energyBlocked||reviewBlocked;return <article id={`action-${id}`} className="experiment-card action-card explained-card" key={id}><div className="experiment-head"><span>{activity.icon}</span><div><h3>{copy.name}</h3><small>{t("科研行动","Research Action")}</small></div><b>{activity.slots} {t("格","slot")}</b></div><p>{copy.description}</p><div className="badges"><span>{t("经费","Cost")} ¥0</span><span>{t("时间","Time")} {activity.slots} {t("格","slot")}</span><span>{t("精力","Energy")} {activity.energy>=0?`+${activity.energy}`:activity.energy}</span></div><button disabled={blocked} onClick={()=>addActivity(id)}>{energyBlocked?t("精力耗尽，先恢复","Recover Energy First"):reviewBlocked?t("收到修回后开放","Unlocks During Revision"):t("排入这两周","Add to Schedule")}</button><div className="card-tooltip"><b>{t("什么时候选它？","When Should I Use It?")}</b><span>{copy.description}</span><small>{id==="review"?t("仅在收到修回意见后开放。","Only available after reviewer comments arrive."):id==="figure"?t("至少先获得一项实验数据。","Collect at least one result first."):id==="thesis"?t("第三年后半段开放。","Unlocks late in year three."):t("它不会产生正式实验结果，但会改变你的科研进度或状态。","Changes progress or status without producing formal evidence.")}</small></div></article>})}
+      {section==="life"&&<article className="experiment-card action-card"><div className="experiment-head"><span>☕</span><div><h3>{t("找同门合作","Ask a Labmate")}</h3><small>{t("关系行动","Relationship Action")}</small></div><b>1 {t("格","slot")}</b></div><p>{t("课题组每局随机生成 3–10 人；向具体成员求助会增加关系和人情债。","Each run creates a 3–10 person lab. Asking for help builds both relationships and favor debt.")}</p><button onClick={()=>setTab("people")}>{t("去课题组选择对象","Choose a Labmate")}</button></article>}
+    </div></>}</>}
+    {tab==="people"&&<><p className="library-hint">{t(`本局从 20 人池随机组成 ${state.lab.length} 人课题组；成员会毕业、离组，也可能成为合作者或恋人。`,`This run draws ${state.lab.length} members from a pool of 20. They may graduate, leave, collaborate, or become an eligible partner.`)}</p><div className="people-list">{state.lab.map((member,index)=>{const copy=memberText(member,locale,index);return <article className={!member.active?"inactive":""} key={member.id}><span>{member.icon}</span><div><h3>{copy.name} <small>{copy.role}</small></h3><p>{copy.personality} · {t("擅长","Specialty")}: {copy.specialty}</p><i><b style={{width:`${member.relation}%`}}/></i><small>{t("关系","Relation")} {member.relation} · {t("人情债","Favor Debt")} {member.favorDebt} · {t(`第 ${member.leaveTurn} 回合离组`,`Leaves turn ${member.leaveTurn}`)}</small></div>{member.active&&<div className="person-actions"><button onClick={()=>addActivity("collaborate",member.id)}>{t("找 TA 合作","Collaborate")}</button>{member.romanceEligible&&member.relation>=65&&<button className="date" onClick={()=>addActivity("date",member.id)}>{t("约会","Date")}</button>}</div>}</article>})}</div></>}
+    {tab==="papers"&&<div className="paper-list">{state.manuscripts.map((paper,index)=>{const project=state.projects.find(item=>item.runId===paper.projectRunId)!;const current=paper.projectRunId===state.currentProjectRunId;const projectCopy=projectText(project,locale);const journal=paper.journalId?JOURNALS.find(item=>item.id===paper.journalId):undefined;const journalName=journal?(locale==="en-US"?CHINESE_JOURNAL_EN[journal.name]??journal.name:journal.name):t("未选刊","No journal selected");return <article className={current?"current":""} key={paper.id}><span>P{index+1}</span><div><p className="eyebrow">{paper.status.toUpperCase()} {current?t("· 当前课题","· CURRENT PROJECT"):""}</p><h3>{locale==="en-US"?projectCopy.title:paper.title}</h3><small>{journalName} · {t("质量","Quality")} {paper.quality} · {t("完整性","Completeness")} {paper.completeness}{paper.reviewDeadlineTurn?t(` · 修回截止第 ${paper.reviewDeadlineTurn} 回合`,` · revision due turn ${paper.reviewDeadlineTurn}`):""}</small>{paper.requirements.map(note=><p className="paper-note" key={note}>{freeText(note,locale,"A reviewer request still needs attention.")}</p>)}</div>{project.active&&!current&&<button onClick={()=>{const result=switchProject(state,project.runId);if(result.ok)onChange(result.state);else notify(locale==="en-US"?freeText(engineError(result),locale,"Unable to switch projects."):engineError(result));}}>{t("切换到这篇","Switch to This Paper")}</button>}</article>})}</div>}
+    {tab==="log"&&<div className="log-list">{[...state.logs].reverse().map((entry,index)=><article key={`${entry.turn}-${index}`}><span>{entry.turn}</span><div><b>{freeText(entry.title,locale,"Research Update")}</b><p>{freeText(entry.text,locale,"The run state has been updated.")}</p></div></article>)}</div>}
+  </div><div className="schedule"><div className="schedule-head"><div><p className="eyebrow">{t("本回合·两周计划","THIS TURN · TWO-WEEK PLAN")}</p><h3>{plannedSlots(state)} / {planCapacity(state)} {t("格","SLOTS")}</h3></div><div className="overtime"><span>{t("加班","Overtime")}</span>{([0,1,2] as const).map(value=><button className={state.overtimeSlots===value?"active":""} onClick={()=>setExtra(value)} key={value}>+{value}</button>)}</div></div><div className="slots">{Array.from({length:planCapacity(state)},(_,index)=><div className={index>=5?"extra":""} key={index}><b>{index+1}</b></div>)}</div><div className="plan-items">{state.plan.map(item=><button className={item.locked?"locked":""} disabled={item.locked} onClick={()=>onChange(removePlanItem(state,item.id))} key={item.id}>{item.icon} {freeText(item.label,locale,"Scheduled action")} · {item.slots} {t("格","slots")} {item.locked?"🔒":"×"}</button>)}</div><footer><button onClick={()=>onChange(clearPlan(state))}>{t("清空可选项","Clear Optional Items")}</button><button onClick={()=>onChange(autoFillPlan(state))}>{t("智能补满","Auto-Fill")}</button><span>{state.overtimeSlots?t(`加班惩罚：精力 -${state.overtimeSlots*10}，SAN -${state.overtimeSlots*4}`,`Overtime penalty: Energy −${state.overtimeSlots*10}, SAN −${state.overtimeSlots*4}`):t("跨回合任务自动续排；新实验开始时扣全款，失败不退款。","Long experiments carry over automatically. New experiments charge in full and failures are not refunded.")}</span></footer></div></section>;
+}
+
+function EventModal({state,onChange}:{state:GameStateV4;onChange:(state:GameStateV4)=>void}) {
+  const {locale}=useLocale();const original=EVENTS.find(item=>item.id===state.pendingEventId);if(!original)return null;const event=eventText(original,locale);
+  return <div className="modal-layer"><section className="modal event"><span className="modal-symbol">{event.icon}</span><p className="eyebrow">RANDOM EVENT · {event.category}</p><h2>{event.title}</h2><q>{event.speaker}: {event.text}</q><div className="choices">{original.choices.map((choice,index)=>{const copy=choiceText(choice,original,index,locale);return <button key={choice.label} onClick={()=>onChange(applyEventChoice(state,choice))}><em>{["A","B","C","D"][index]}</em><span><b>{copy.label}</b><small>{copy.hint}</small></span></button>})}</div></section></div>;
+}
+
+function ResultsModalEn({results,onClose}:{results:TurnResult[];onClose:()=>void}) {
+  return <div className="modal-layer"><section className="modal results"><p className="eyebrow">TURN RESOLVED</p><h2>What Happened in These Two Weeks?</h2><div>{results.map(row=><article className={row.tone} key={row.id}><span>{row.icon}</span><div><b>{freeText(row.title,"en-US","Research Action")}</b><strong>{freeText(row.result,"en-US",row.tone==="bad"?"Setback":"Progress")}</strong><small>{freeText(row.detail,"en-US","Progress, evidence, and resources have been updated.")}</small></div></article>)}</div><button className="primary full" onClick={onClose}>Continue</button></section></div>;
+}
+
+function JournalsModalEn({state,onChange,onClose,notify}:{state:GameStateV4;onChange:(state:GameStateV4)=>void;onClose:()=>void;notify:(text:string)=>void}) {
+  const current=state.projects.find(project=>project.runId===state.currentProjectRunId)!;
+  return <div className="modal-layer"><section className="modal journals"><button className="close" onClick={onClose}>×</button><p className="eyebrow">30 REAL JOURNALS</p><h2>Choose a Target Journal</h2><p>Figure counts are game targets unless a journal publishes an official limit. Evidence coverage is still required.</p><div className="journal-list">{JOURNALS.map(journal=>{const gaps=journalSubmissionGaps(current,journal);const name=CHINESE_JOURNAL_EN[journal.name]??journal.name;return <article key={journal.id}><div><span>{journal.publicationClass}</span><h3>{name}</h3><p>{journal.metricLabel} {journal.metricValue??"—"} ({journal.metricYear}) · {journal.reviewDays[0]}–{journal.reviewDays[1]} days{journal.reviewEstimate?" · game estimate":""}</p><small>{journal.scope.map(item=>SCOPE_EN[item]??item).join(", ")} · quality threshold {journal.qualityNeed}</small><p className="journal-profile">{journalProfile(journal.language,journal.publicationClass==="SCI_HIGH","en-US")}</p><p className={gaps.length?"journal-gap":"journal-ready"}>{gaps.length?`${gaps.length} preparation gaps remain: figures and required evidence are checked together.`:"The current evidence and figures meet the submission target."}</p></div><button disabled={gaps.length>0||current.writingProgress<55} onClick={()=>{const result=submitManuscript(state,journal.id);if(result.ok){onChange(result.state);onClose();}else notify(freeText(engineError(result),"en-US","The manuscript is not ready for this journal."));}}>{current.writingProgress<55?"Manuscript Incomplete":gaps.length?"Evidence Missing":"Submit Here"}</button></article>})}</div></section></div>;
+}
+
+function ReviewModalEn({state,onChange,onClose,onNext,notify}:{state:GameStateV4;onChange:(state:GameStateV4)=>void;onClose:()=>void;onNext:()=>void;notify:(text:string)=>void}) {
+  const paper=state.manuscripts.find(item=>item.projectRunId===state.currentProjectRunId)!;
+  const respond=(strategy:"complete"|"key-only"|"rebuttal")=>{const result=submitReviewResponse(state,strategy);if(result.ok){onChange(result.state);onClose();}else notify(freeText(engineError(result),"en-US","More revision work is required before submitting the response."));};
+  return <div className="modal-layer"><section className="modal review-modal"><button className="close" onClick={onClose}>×</button><p className="eyebrow">REVISION WORKBENCH</p><h2>A Revision Is More Than a Letter</h2><p>Due turn {paper.reviewDeadlineTurn} · response {paper.responseProgress}% · tasks {paper.reviewRequests.filter(item=>item.completed).length}/{paper.reviewRequests.length}</p><div className="review-task-list">{paper.reviewRequests.map(request=><article className={request.completed?"done":""} key={request.id}><b>{request.completed?"✓":"○"}</b><div><h3>{freeText(request.text,"en-US","Reviewer requests additional evidence or clarification.")}</h3><span>{freeText(request.suggestedAction,"en-US","Complete the matching experiment or writing action")}{request.essential?" · essential":" · may be rebutted"}</span></div></article>)}</div><div className="review-strategies"><button onClick={()=>respond("complete")}><b>Complete Every Request</b><span>Finish all tasks and 60% of the response letter for the best odds.</span></button><button onClick={()=>respond("key-only")}><b>Complete Essential Work</b><span>Finish every essential task and 70% of the response letter.</span></button><button onClick={()=>respond("rebuttal")}><b>Explain or Rebut</b><span>Submit at 80% response progress without every experiment, at higher risk.</span></button><button onClick={onNext}><b>Pause and Start Paper 2</b><span>The revision deadline keeps counting down.</span></button><button className="withdraw" onClick={()=>{const result=withdrawManuscript(state);if(result.ok){onChange(result.state);onClose();}else notify("This manuscript cannot be withdrawn now.");}}><b>Withdraw and Transfer</b><span>Keep all data and revision progress for another journal.</span></button></div></section></div>;
+}
+
+function NextProjectModalEn({state,onChange,onClose,notify}:{state:GameStateV4;onChange:(state:GameStateV4)=>void;onClose:()=>void;notify:(text:string)=>void}) {
+  const current=state.projects.find(project=>project.runId===state.currentProjectRunId)!;const paper=state.manuscripts.find(item=>item.projectRunId===current.runId)!;
+  const begin=(setup:ProjectSetup,mode:"extension"|"base")=>{const result=paper.status==="accepted"?startNextProject(state,setup,mode):startParallelProject(state,setup,mode);if(result.ok){onChange(result.state);onClose();}else notify(freeText(engineError(result),"en-US","A third active paper cannot be started."));};
+  return <div className="modal-layer"><section className="modal next"><button className="close" onClick={onClose}>×</button><p className="eyebrow">NEXT MANUSCRIPT · TWO ACTIVE MAXIMUM</p><h2>{paper.status==="accepted"?"Advance This Research Program or Change Direction?":"Start Paper 2 While Paper 1 Is Under Review"}</h2><div className="next-list">{paper.status==="accepted"&&<button onClick={()=>begin({...current,definitionId:current.id},"extension")}><b>Extend Existing Data</b><span>Carry over limited evidence while deepening the same question.</span></button>}{getNextProjectChoices(state.seed+state.projects.length*97,current).map(project=>{const copy=projectText(project,"en-US");return <button key={project.id} onClick={()=>begin(asSetup(project),"base")}><b>{project.programId===current.programId?`Program Stage ${project.stage} · `:"New Program · "}{copy.title}</b><span>{projectProblem(copy,"en-US")}</span></button>})}</div></section></div>;
+}
+
+function Overlay({modal,setModal,state,onChange,results,notify}:{modal:Modal;setModal:(modal:Modal)=>void;state:GameStateV4;onChange:(state:GameStateV4)=>void;results:TurnResult[];notify:(text:string)=>void}) {
+  const {locale}=useLocale();
+  const current=state.projects.find(project=>project.runId===state.currentProjectRunId)!;
+  const currentPaper=state.manuscripts.find(paper=>paper.projectRunId===current.runId)!;
+  const beginProject=(setup:ProjectSetup,mode:"extension"|"base")=>{const result=currentPaper.status==="accepted"?startNextProject(state,setup,mode):startParallelProject(state,setup,mode);if(result.ok){onChange(result.state);setModal(null);}else notify(engineError(result));};
+  if(modal==="guide")return <GuideModal onClose={()=>setModal(null)}/>;
+  if(locale==="en-US"&&modal==="results")return <ResultsModalEn results={results} onClose={()=>setModal(null)}/>;
+  if(locale==="en-US"&&modal==="journals")return <JournalsModalEn state={state} onChange={onChange} onClose={()=>setModal(null)} notify={notify}/>;
+  if(locale==="en-US"&&modal==="review")return <ReviewModalEn state={state} onChange={onChange} onClose={()=>setModal(null)} onNext={()=>setModal("next")} notify={notify}/>;
+  if(locale==="en-US"&&modal==="next")return <NextProjectModalEn state={state} onChange={onChange} onClose={()=>setModal(null)} notify={notify}/>;
+  if(modal==="results")return <div className="modal-layer"><section className="modal results"><p className="eyebrow">TURN RESOLVED</p><h2>这两周发生了什么</h2><div>{results.map(row=><article className={row.tone} key={row.id}><span>{row.icon}</span><div><b>{row.title}</b><strong>{row.result}</strong><small>{row.detail}</small></div></article>)}</div><button className="primary full" onClick={()=>setModal(null)}>继续</button></section></div>;
+  if(modal==="journals")return <div className="modal-layer"><section className="modal journals"><button className="close" onClick={()=>setModal(null)}>×</button><p className="eyebrow">30 REAL JOURNALS</p><h2>选择投稿目标</h2><p>图片数量是游戏建议；期刊没有明确图数时不会冒充官方硬性规定。</p><div className="journal-list">{JOURNALS.map(journal=>{const gaps=journalSubmissionGaps(current,journal);return <article key={journal.id}><div><span>{journal.publicationClass}</span><h3>{journal.name}</h3><p>{journal.metricLabel} {journal.metricValue??"—"} ({journal.metricYear}) · {journal.reviewDays[0]}–{journal.reviewDays[1]} 天{journal.reviewEstimate?"·游戏估算":""}</p><small>{journal.scope.join("、")} · 质量门槛 {journal.qualityNeed}</small><p className="journal-profile">{journal.submissionProfile}</p><p className={gaps.length?"journal-gap":"journal-ready"}>{gaps.length?`目前：${gaps.slice(0,3).join("；")}`:"目前证据和主图已达到投稿准备度"}</p></div><button disabled={gaps.length>0||current.writingProgress<55} onClick={()=>{const result=submitManuscript(state,journal.id);if(result.ok){onChange(result.state);setModal(null);}else notify(engineError(result));}}>{current.writingProgress<55?"稿件未完成":gaps.length?"尚缺证据":"投这本"}</button></article>})}</div></section></div>;
+  if(modal==="review")return <div className="modal-layer"><section className="modal review-modal"><button className="close" onClick={()=>setModal(null)}>×</button><p className="eyebrow">REVISION WORKBENCH</p><h2>修回不是只写一封信</h2><p>截止第 {currentPaper.reviewDeadlineTurn} 回合 · 回复信 {currentPaper.responseProgress}% · 任务 {currentPaper.reviewRequests.filter(item=>item.completed).length}/{currentPaper.reviewRequests.length}</p><div className="review-task-list">{currentPaper.reviewRequests.map(request=><article className={request.completed?"done":""} key={request.id}><b>{request.completed?"✓":"○"}</b><div><h3>{request.text}</h3><span>{request.suggestedAction}{request.essential?" · 关键任务":" · 可解释申辩"}</span></div></article>)}</div><div className="review-strategies"><button onClick={()=>{const result=submitReviewResponse(state,"complete");if(result.ok){onChange(result.state);setModal(null);}else notify(engineError(result));}}><b>逐条完成后回复</b><span>全任务完成＋回复信 60%，接收率最高。</span></button><button onClick={()=>{const result=submitReviewResponse(state,"key-only");if(result.ok){onChange(result.state);setModal(null);}else notify(engineError(result));}}><b>只补关键实验</b><span>关键任务完成＋回复信 70%，节省时间但有风险。</span></button><button onClick={()=>{const result=submitReviewResponse(state,"rebuttal");if(result.ok){onChange(result.state);setModal(null);}else notify(engineError(result));}}><b>解释或申辩</b><span>回复信 80% 即可提交，拒稿风险明显更高。</span></button><button onClick={()=>setModal("next")}><b>暂时搁置，准备第二篇</b><span>修回期限仍会继续倒计时。</span></button><button className="withdraw" onClick={()=>{const result=withdrawManuscript(state);if(result.ok){onChange(result.state);setModal(null);}else notify(engineError(result));}}><b>撤稿后转投</b><span>保留全部数据和修改进度，重新选择期刊。</span></button></div></section></div>;
+  if(modal==="next")return <div className="modal-layer"><section className="modal next"><button className="close" onClick={()=>setModal(null)}>×</button><p className="eyebrow">NEXT MANUSCRIPT · 最多并行两篇</p><h2>{currentPaper.status==="accepted"?"下一篇沿研究线深入，还是换方向？":"外审等待期，启动第二篇"}</h2><div className="next-list">{currentPaper.status==="accepted"&&<button onClick={()=>beginProject({...current,definitionId:current.id},"extension")}><b>延伸现有数据</b><span>继承少量证据，但仍研究当前问题。</span></button>}{getNextProjectChoices(state.seed+state.projects.length*97,current).map(project=><button key={project.id} onClick={()=>beginProject(asSetup(project),"base")}><b>{project.programId===current.programId?`研究线阶段 ${project.stage} · `:"换研究线 · "}{project.title}</b><span>{projectProblem(project,"zh-CN")}</span></button>)}</div></section></div>;
+  return null;
+}
+
+function Game({state,onChange,onMenu,onNewRun}:{state:GameStateV4;onChange:(state:GameStateV4)=>void;onMenu:()=>void;onNewRun:()=>void}) {
+  const {locale,t}=useLocale();const [modal,setModal]=useState<Modal>(null);const [results,setResults]=useState<TurnResult[]>([]);const [notice,setNotice]=useState("");const [plannerTab,setPlannerTab]=useState<Tab>("library");const [librarySection,setLibrarySection]=useState<LibrarySection>("center");const [formalGroup,setFormalGroup]=useState<(typeof FORMAL_GROUPS)[number]["id"]>("cell");const ending=endingText(ENDINGS.find(item=>item.id===state.endingId),locale);
+  useEffect(()=>{if(!notice)return;const timer=setTimeout(()=>setNotice(""),3000);return()=>clearTimeout(timer);},[notice]);
+  const year=Math.min(4,Math.floor((state.turn-1)/26)+1);const phaseEn=state.turn<=13?"Year 1 · Getting Oriented":state.turn<=26?"Year 1 · Building Foundations":state.turn<=52?"Year 2 · Producing Evidence":state.turn<=65?"Year 3 · Manuscript Sprint":state.turn<=78?"Year 3 · Graduation Window":"Extended Study";const turnEn=`Year ${year} · Weeks ${((state.turn-1)%26)*2+1}–${((state.turn-1)%26)*2+2}`;
+  if(state.finished)return <main className="ending-screen"><LanguageToggle compact/><p className="eyebrow">RUN COMPLETE · {locale==="en-US"?turnEn:turnLabel(state.turn)}</p><span className="ending-symbol">{ending?.family==="失败"||ending?.family==="Failure"?"∴":"Ω"}</span><h1>{ending?.title}</h1><p>{ending?.description}</p><div><span>{t("论文","Papers")} <b>{state.manuscripts.filter(item=>item.status==="accepted").length}</b></span><span>{t("实验","Experiments")} <b>{state.totalExperiments}</b></span><span>{t("意外发现","Surprises")} <b>{state.surprises}</b></span><span>{t("诚信","Integrity")} <b>{state.integrity}</b></span></div><section className="ending-actions"><button className="primary" onClick={onNewRun}>{t("立即开启下一周目","Start Another Run")}</button><button className="secondary" onClick={onMenu}>{t("返回主菜单","Main Menu")}</button></section></main>;
+  const resolve=()=>{const result=resolveTurn(state);if(!result.ok)setNotice(locale==="en-US"?freeText(engineError(result),locale,"The two-week plan cannot be resolved yet."):engineError(result));else{onChange(result.state.state);setResults(result.state.results);setModal("results");}};
+  const defense=()=>{const result=finishRun(state);if(result.ok)onChange(result.state);else setNotice(locale==="en-US"?freeText(engineError(result),locale,"You are not eligible to defend yet."):engineError(result));};
+  const focusSuggestion=(section:LibrarySection,id:string)=>{setPlannerTab("library");setLibrarySection(section);const group=FORMAL_GROUPS.find(item=>(item.experiments as readonly string[]).includes(id));if(group)setFormalGroup(group.id);window.setTimeout(()=>document.getElementById(`action-${id}`)?.scrollIntoView({behavior:"smooth",block:"center"}),80);};
+  return <main className="game-screen"><header className="game-header"><TitleMark/><div><span>{locale==="en-US"?phaseEn:getPhase(state)}</span><b>{locale==="en-US"?`Turn ${state.turn} / 78`:`第 ${state.turn} / 78 回合`}</b><small>{locale==="en-US"?`${turnEn} · extension limit 104`: `${turnLabel(state.turn)} · 延毕上限 104`}</small></div><div className="header-actions"><LanguageToggle compact/><button onClick={()=>setModal("guide")}>? {t("引导","Guide")}</button><button onClick={onMenu}>{t("主菜单","Main Menu")}</button></div></header><ResourceBar state={state}/><LabScene state={state}/><Overview state={state} onJournal={()=>setModal("journals")} onReview={()=>setModal("review")} onNext={()=>setModal("next")} onSuggestion={focusSuggestion} onDefense={defense} notify={setNotice}/><Planner state={state} onChange={onChange} notify={text=>setNotice(locale==="en-US"?freeText(text,locale,"This action is unavailable right now."):text)} tab={plannerTab} setTab={setPlannerTab} section={librarySection} setSection={setLibrarySection} formalGroup={formalGroup} setFormalGroup={setFormalGroup}/><button className="execute" disabled={plannedSlots(state)!==planCapacity(state)||Boolean(state.pendingEventId)} onClick={resolve}><b>{t("执行两周计划","Resolve Two-Week Plan")}</b><span>{plannedSlots(state)} / {planCapacity(state)} {t("格已安排","slots scheduled")}</span></button><EventModal state={state} onChange={onChange}/><Overlay modal={modal} setModal={setModal} state={state} onChange={onChange} results={results} notify={text=>setNotice(locale==="en-US"?freeText(text,locale,"This action is unavailable right now."):text)}/>{notice&&<div className="toast">{notice}</div>}</main>;
+}
+
+function HomeContent() {
+  const [screen,setScreen]=useState<Screen>("menu");const [seed,setSeed]=useState(20260815);const [refresh,setRefresh]=useState<0|1>(0);const [candidate,setCandidate]=useState<Candidate|null>(null);const [state,setState]=useState<GameStateV4|null>(null);const [savedAtMount,setSavedAtMount]=useState(false);const hasSave=savedAtMount||Boolean(state);
+  useEffect(()=>{const timer=window.setTimeout(()=>setSavedAtMount(hasSavedGame()),0);return()=>window.clearTimeout(timer);},[]);
+  useEffect(()=>{if(!state)return;saveGameState(state);setSavedAtMount(true);},[state]);
+  const newRun=()=>{setSeed(Date.now()%2147483647);setRefresh(0);setCandidate(null);setState(null);setScreen("candidate");};
+  const resume=()=>{const restored=loadGameState();if(restored){setState(restored as GameStateV4);setScreen("game");}else setSavedAtMount(false);};
+  if(screen==="menu")return <StartMenu hasSave={hasSave} onContinue={resume} onNew={newRun}/>;
+  if(screen==="candidate")return <CandidateSelect seed={seed} refresh={refresh} onRefresh={()=>setRefresh(1)} onSelect={value=>{setCandidate(value);setScreen("setup");}} onMenu={()=>setScreen("menu")}/>;
+  if(screen==="setup"&&candidate)return <ProjectSetup seed={seed} candidate={candidate} onBack={()=>setScreen("candidate")} onStart={setup=>{setState(createRun(seed,candidate.id,setup));setScreen("game");}}/>;
+  if(screen==="game"&&state)return <Game state={state} onChange={setState} onMenu={()=>setScreen("menu")} onNewRun={newRun}/>;
+  return null;
+}
+
+export default function Home() {
+  const [locale,setLocaleState]=useState<Locale>("zh-CN");
+  useEffect(()=>{const timer=window.setTimeout(()=>{try{const saved=localStorage.getItem(LOCALE_KEY);if(saved==="en-US"||saved==="zh-CN")setLocaleState(saved);}catch{/* storage blocked; default language is still playable */}},0);return()=>window.clearTimeout(timer);},[]);
+  const setLocale=(next:Locale)=>{setLocaleState(next);try{localStorage.setItem(LOCALE_KEY,next);}catch{/* memory-only mode */}document.documentElement.lang=next;};
+  useEffect(()=>{document.documentElement.lang=locale;},[locale]);
+  return <ErrorBoundary><LocaleProvider locale={locale} setLocale={setLocale}><HomeContent/></LocaleProvider></ErrorBoundary>;
+}
+
+class ErrorBoundary extends Component<{children:ReactNode},{hasError:boolean}> {
+  state={hasError:false};
+  static getDerivedStateFromError(){return {hasError:true};}
+  componentDidCatch(_error:Error,_info:ErrorInfo){/* keep the game shell available even when a save is malformed */}
+  render(){return this.state.hasError
+    ? <main className="start-screen"><section className="start-copy"><p className="eyebrow">LAB LIFE · RECOVERY MODE</p><h1>实验室<br/><em>摸鱼</em>模拟器</h1><p>这份存档暂时无法载入。你可以返回主菜单并开始新周目，旧存档仍保留在本地。</p><button className="primary" data-recovery-action="reload-menu" onClick={()=>window.location.reload()}>返回主菜单</button></section></main>
+    : this.props.children;}
 }
